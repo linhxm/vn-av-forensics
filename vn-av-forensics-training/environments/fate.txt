@@ -2,7 +2,7 @@
 torch>=2.6
 torchvision>=0.21
 transformers>=5,<6
-peft>=0.18
+peft==0.18.0
 safetensors>=0.5
 timm>=1.0
 huggingface-hub>=0.34
