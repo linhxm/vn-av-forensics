@@ -1,0 +1,10 @@
+# Isolated FATE environment; upstream imports modern Transformers internals.
+torch>=2.6
+torchvision>=0.21
+transformers>=5,<6
+peft>=0.18
+safetensors>=0.5
+timm>=1.0
+huggingface-hub>=0.34
+accelerate>=1.0
+numpy>=2,<3

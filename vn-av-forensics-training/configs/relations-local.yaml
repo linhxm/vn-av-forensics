@@ -1,0 +1,5 @@
+extends: relations.yaml
+device: cpu
+encoder:
+  device: cpu
+# Keep precision/window/bin options identical to the Kaggle cache signature.

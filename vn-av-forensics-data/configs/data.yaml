@@ -1,0 +1,12 @@
+curation:
+  face_model: checkpoints/media/yunet.onnx
+  vad_model: checkpoints/media/silero_vad.onnx
+  min_seconds: 3.0
+  max_seconds: 8.0
+  overlap_seconds: 1.0
+  sample_fps: 4.0
+  scan_max_side: 640
+  min_face_size: 64
+  min_face_ratio: 0.9
+  scene_correlation: 0.55
+  max_source_hours: 12
