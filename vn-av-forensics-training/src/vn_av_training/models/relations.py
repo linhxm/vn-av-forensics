@@ -12,8 +12,8 @@ from torch.nn import functional as F
 
 from vn_av_training.models.detector import TemporalBlock, correspondence
 
-RELATIONS = ("phoneme_viseme", "sequence", "motion_speech", "source")
-ACTIVITIES = ("audio_speech", "visual_speech")
+RELATIONS = ("lip_audio_mismatch",)
+HEADS = ("timing", *RELATIONS)
 
 
 class RelationHeads(nn.Module):
@@ -55,10 +55,8 @@ class RelationHeads(nn.Module):
         self.fusion = nn.Linear(4 * projection + 2, hidden)
         self.blocks = nn.ModuleList(TemporalBlock(hidden, d, dropout) for d in (1, 2, 4))
         self.heads = nn.ModuleDict({name: nn.Linear(hidden, 1) for name in RELATIONS})
-        self.audio_speech = nn.Linear(projection, 1)
-        self.visual_speech = nn.Linear(projection, 1)
 
-    def forward(self, batch, use_lag_alignment=True):
+    def forward(self, batch, use_lag_alignment=True, progress=None):
         audio, visual = batch["audio"].float(), batch["visual"].float()
         if audio.ndim != 3 or visual.ndim != 3 or audio.shape[:2] != visual.shape[:2]:
             raise ValueError("Expected [batch, time, feature] on the same time grid")
@@ -74,6 +72,8 @@ class RelationHeads(nn.Module):
         a = self.audio(audio.masked_fill(~am[..., None], 0)).masked_fill(~am[..., None], 0)
         v = self.visual(visual.masked_fill(~vm[..., None], 0)).masked_fill(~vm[..., None], 0)
         valid = am & vm
+        if progress:
+            progress("timing", "Đang ước lượng lag từ đặc trưng audio và hình dùng chung")
         radius, context = self.config["radius"], self.config["context"]
         scores, pairs = correspondence(a, v, am, vm, radius)
         counts = F.avg_pool1d(pairs.float().transpose(1, 2), context, 1, context // 2)
@@ -95,6 +95,8 @@ class RelationHeads(nn.Module):
         aligned_v = v.gather(1, index[..., None].expand_as(v))
         # Never force a different utterance to match. Keep the raw pair if uncertain.
         aligned_v = torch.where(lag_valid[..., None], aligned_v, v)
+        if progress:
+            progress("mismatch", "Đang so môi–âm thanh bằng cặp đặc trưng gốc và cặp căn chỉnh đáng tin; không sửa video")
         x = F.gelu(
             self.fusion(
                 torch.cat(
@@ -105,8 +107,6 @@ class RelationHeads(nn.Module):
         for block in self.blocks:
             x = block(x, valid)
         relation_logits = {name: head(x).squeeze(-1) for name, head in self.heads.items()}
-        relation_logits["audio_speech"] = self.audio_speech(a).squeeze(-1)
-        relation_logits["visual_speech"] = self.visual_speech(v).squeeze(-1)
         return {
             "logits": relation_logits,
             "valid": valid,
@@ -117,25 +117,27 @@ class RelationHeads(nn.Module):
             "lag_steps": steps,
             "lag_valid": lag_valid,
             "lag_confidence": confidence,
+            "alignment_used": lag_valid,
+            "aligned_visual_index": index,
         }
 
 
-def relation_loss(outputs, targets):
+def relation_loss(outputs, targets, weights=None):
     """Partial supervision: -1 is unknown, never silently a negative.
 
     lag_class: 0..2*radius for signed offsets, 2*radius+1 for no-match.
     Binary heads: 0/1, with -1 for missing/unobservable annotations.
-    A phoneme_viseme head needs its own vetted labels, not generic forgery labels.
+    Mismatch labels describe incompatibility remaining after plausible timing compensation.
     """
+    weights = weights or {}
     losses = {}
-    for name in (*RELATIONS, *ACTIVITIES):
+    for name in RELATIONS:
         if name not in targets:
             continue
         y = targets[name]
         if y.shape != outputs["valid"].shape or not torch.isin(y, y.new_tensor([-1, 0, 1])).all():
             raise ValueError(f"Invalid binary labels: {name}")
-        mask_name = {"audio_speech": "audio_valid", "visual_speech": "visual_valid"}
-        mask = outputs[mask_name.get(name, "valid")] & (y >= 0)
+        mask = outputs["valid"] & (y >= 0)
         if mask.any():
             losses[name] = F.binary_cross_entropy_with_logits(
                 outputs["logits"][name][mask], y[mask].float()
@@ -155,4 +157,5 @@ def relation_loss(outputs, targets):
             losses["timing"] = F.cross_entropy(outputs["lag_logits"][mask], y[mask].long())
     if not losses:
         raise ValueError("No observed relation labels in this batch")
-    return torch.stack(list(losses.values())).mean(), losses
+    values = [loss * float(weights.get(name, 1.0)) for name, loss in losses.items()]
+    return torch.stack(values).sum(), losses

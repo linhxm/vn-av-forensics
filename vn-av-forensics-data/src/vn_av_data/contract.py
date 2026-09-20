@@ -12,7 +12,15 @@ from collections import Counter
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 SCHEMA = "vn-av-dataset-v1"
-HEADS = {"phoneme_viseme", "sequence", "motion_speech", "source", "audio_speech", "visual_speech"}
+HEADS = {
+    "lip_audio_mismatch",
+    "phoneme_viseme",
+    "sequence",
+    "motion_speech",
+    "source",
+    "audio_speech",
+    "visual_speech",
+}
 
 
 def file_sha(path):
@@ -121,3 +129,52 @@ def validate_bundle(root, probe=None):
             Counter(name for row in rows for name in row.get("relation_annotations", {}))
         ),
     }
+
+
+def mismatch_annotation(annotations, duration, assume_clean=False):
+    """Any verified subtype positive is positive; negative requires all three known.
+
+    Source/identity/activity-stream labels do not imply lip-audio correspondence.
+    """
+    validate_annotations(annotations, duration)
+    if "lip_audio_mismatch" in annotations:
+        return annotations["lip_audio_mismatch"]
+    names = ("phoneme_viseme", "sequence", "motion_speech")
+    if not annotations and assume_clean:
+        return {"known": [[0, duration]], "positive": []}
+    bounds = sorted(
+        {
+            0,
+            duration,
+            *(
+                t
+                for name in names
+                for spans in annotations.get(name, {}).values()
+                for span in spans
+                for t in span
+            ),
+        }
+    )
+    result = {"known": [], "positive": []}
+
+    def append(key, a, b):
+        if result[key] and abs(result[key][-1][1] - a) < 1e-8:
+            result[key][-1][1] = b
+        else:
+            result[key].append([a, b])
+
+    for a, b in zip(bounds, bounds[1:]):
+        mid = (a + b) / 2
+        positive = any(
+            any(x <= mid < y for x, y in annotations.get(n, {}).get("positive", [])) for n in names
+        )
+        negative = all(
+            any(x <= mid < y for x, y in annotations.get(n, {}).get("known", []))
+            and not any(x <= mid < y for x, y in annotations.get(n, {}).get("positive", []))
+            for n in names
+        )
+        if positive or negative:
+            append("known", a, b)
+        if positive:
+            append("positive", a, b)
+    return result

@@ -1,0 +1,8 @@
+seed: 42
+step_s: 0.2
+radius: 4
+window_s: 2.0
+shifts_s: [-0.8, -0.6, -0.4, -0.2, 0.2, 0.4, 0.6, 0.8]
+techniques: [global_lag, local_lag, sequence_swap, motion_freeze, content_splice]
+crfs: [18]
+max_side: 640

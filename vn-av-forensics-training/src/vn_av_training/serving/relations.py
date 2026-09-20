@@ -65,7 +65,7 @@ def aggregate_relations(
             masks[name] = lag_valid
         else:
             scores[name] = array(outputs["logits"][name].sigmoid())
-            masks[name] = valid
+            masks[name] = array(outputs.get("mismatch_valid", outputs["valid"])).astype(bool)
         if not np.isfinite(scores[name][masks[name]]).all():
             raise ValueError(f"Nonfinite scores: {name}")
 
@@ -95,6 +95,12 @@ def aggregate_relations(
                 "end": float(start + step_s),
                 "inconsistency_score": max(observed) if observed else None,
                 "relation_scores": relations,
+                "alignment_used": bool(
+                    array(outputs.get("alignment_used", outputs["lag_valid"]))[i]
+                ),
+                "matched_visual_time_s": float(times[i] + lag[i] / 1000)
+                if array(outputs.get("alignment_used", outputs["lag_valid"]))[i]
+                else None,
                 "estimated_lag_ms": float(lag[i]) if lag_valid[i] else None,
                 "lag_confidence": float(confidence[i])
                 if valid[i] and "timing" in trained
@@ -119,7 +125,7 @@ def aggregate_relations(
     ]
     complete = trained == allowed and all(mask.all() for mask in masks.values())
     return {
-        "schema_version": "av-relations-v1",
+        "schema_version": "av-relations-v2",
         "status": "not_assessable" if not clip_scores else "assessed" if complete else "partial",
         "score_kind": "anomaly_score_not_calibrated_probability",
         "clip_inconsistency_score": max(clip_scores) if clip_scores else None,
@@ -132,8 +138,7 @@ def aggregate_relations(
             name: "trained" if name in trained else "untrained" for name in sorted(allowed)
         },
         "coverage": {name: float(mask.mean()) for name, mask in masks.items()},
-        "identity_status": "not_assessed",
-        "identity_reason": "Active-speaker correspondence does not verify voice-face identity",
+        "scope": ["timing", "lip_audio_mismatch"],
     }
 
 
@@ -179,11 +184,13 @@ class RelationAnalyzer:
         self.cfg = cfg
         self.device = cfg.get("device", "cpu")
         self.model, self.state = load_relations(cfg["checkpoint"], self.device)
-        if not self.state["trained_heads"]:
-            raise ValueError("Checkpoint has no relation head with usable validation scores")
+        # Even a failed-quality checkpoint can expose diagnostics, never an accepted finding.
         self.encoder = encoder or FATEVideoEncoder(cfg["encoder"])
         if self.encoder.signature != self.state["feature_signature"]:
-            raise ValueError("Encoder assets/window settings differ from the training cache")
+            from vn_av_training.features.signature import portable_encoder_signature
+
+            if portable_encoder_signature(cfg["encoder"]) != self.state["feature_signature"]:
+                raise ValueError("Encoder assets/window settings differ from the training cache")
 
     @torch.no_grad()
     def analyze(self, video, output, progress=None):
@@ -192,13 +199,17 @@ class RelationAnalyzer:
         progress = progress or (lambda *_: None)
         folder = Path(output)
         folder.mkdir(parents=True, exist_ok=True)
+        from vn_av_training.serving.diagnostics import checkpoint_evidence
+
+        checkpoint = checkpoint_evidence(self.state, self.cfg["checkpoint"])
         row = {"sample_id": "input", "video": str(video), "variant": {"kind": "clean"}}
         progress("features", "Đang trích đặc trưng âm thanh và vùng mặt theo thời gian")
         meta = self.encoder.extract(row, folder / "input.npz")
         row["duration_s"] = meta["duration_s"]
         batch, _, _, times = load_sample(row, folder, self.model.config["radius"], self.device)
         progress("relations", "Đang đánh giá quan hệ tiếng nói–chuyển động miệng")
-        prediction = self.model(batch, use_lag_alignment="timing" in self.state["active_heads"])
+        prediction = self.model(batch, use_lag_alignment="timing" in self.state["active_heads"], progress=progress)
+        progress("aggregation", "Đang tổng hợp theo thời gian và kiểm tra chất lượng từng nhánh")
         report = aggregate_relations(
             prediction,
             times,
@@ -217,8 +228,49 @@ class RelationAnalyzer:
             step_s=meta["step_s"],
             thresholds=self.state["thresholds"],
             model_id=sha(self.cfg["checkpoint"])[:16],
-            notice="Điểm bất nhất môi–tiếng; không phải kết luận thật/giả hoặc xác minh danh tính.",
+            notice="Hai nhánh: lệch thời gian và bất nhất môi–âm thanh còn lại sau khi xét căn chỉnh. Chỉ kết luận ở vùng đủ bằng chứng và nhánh đạt validation; điểm không phải xác suất giả mạo.",
         )
+        report["checkpoint"] = checkpoint
+        report["head_availability"] = checkpoint["head_status"]
+        report["diagnostic_intervals"] = report["suspicious_intervals"]
+        eligible = set(checkpoint["deployable_heads"])
+        from vn_av_training.training.quality import assessment_masks
+
+        assessed = aggregate_relations(
+            assessment_masks(prediction, self.state),
+            times,
+            meta["step_s"],
+            self.state["thresholds"],
+            eligible,
+            self.state.get("lag_tolerance_steps", 0),
+        )
+        report["diagnostic_peak_score"] = report["clip_inconsistency_score"]
+        report["suspicious_intervals"] = assessed["suspicious_intervals"]
+        for span in report["suspicious_intervals"]:
+            span["end"] = min(span["end"], meta["duration_s"])
+        report["clip_inconsistency_score"] = assessed["clip_inconsistency_score"]
+        report["global_lag_ms"] = assessed["global_lag_ms"]
+        report["accepted_coverage"] = assessed["coverage"]
+        for window, accepted in zip(report["window_scores"], assessed["window_scores"]):
+            window["diagnostic_inconsistency_score"] = window["inconsistency_score"]
+            window["diagnostic_estimated_lag_ms"] = window["estimated_lag_ms"]
+            window["inconsistency_score"] = accepted["inconsistency_score"]
+            window["estimated_lag_ms"] = accepted["estimated_lag_ms"]
+            window["accepted_relation_scores"] = accepted["relation_scores"]
+        report["status"] = "diagnostic_only" if not eligible else assessed["status"]
+        report["feature_evidence"] = {
+            "audio_shape": list(batch["audio"].shape),
+            "visual_shape": list(batch["visual"].shape),
+            "window_count": len(times),
+            "audio_valid_windows": int(batch["audio_valid"].sum()),
+            "visual_valid_windows": int(batch["visual_valid"].sum()),
+            "encoder_signature": meta["feature_signature"],
+        }
+        progress("evidence", "Đang xuất khung hình, mức năng lượng audio và báo cáo bằng chứng")
+        if self.cfg.get("export_preprocessing_evidence", True) and Path(video).is_file():
+            from vn_av_training.serving.diagnostics import preprocessing_evidence
+
+            report["preprocessing"] = preprocessing_evidence(video, folder, self.cfg["encoder"])
         receipt = Path(video).with_suffix(".json")
         provenance = None
         if receipt.is_file():
@@ -245,19 +297,16 @@ class RelationAnalyzer:
         import csv
 
         with (folder / "timeline.csv").open("w", encoding="utf-8", newline="") as stream:
-            keys = [
-                "start",
-                "end",
-                "inconsistency_score",
-                "estimated_lag_ms",
-                *self.state["trained_heads"],
-            ]
-            writer = csv.DictWriter(stream, fieldnames=keys)
+            keys = ["start", "end", "inconsistency_score", "estimated_lag_ms",
+                    "diagnostic_inconsistency_score", "diagnostic_estimated_lag_ms",
+                    "alignment_used", "matched_visual_time_s", "lag_confidence"]
+            heads = self.state["trained_heads"]
+            writer = csv.DictWriter(stream, fieldnames=keys + list(heads) + ["diagnostic_" + h for h in heads])
             writer.writeheader()
             for window in report["window_scores"]:
-                writer.writerow(
-                    {**{key: window[key] for key in keys[:4]}, **window["relation_scores"]}
-                )
+                writer.writerow({**{key: window[key] for key in keys},
+                                 **{h: window["accepted_relation_scores"].get(h) for h in heads},
+                                 **{"diagnostic_"+h: window["relation_scores"].get(h) for h in heads}})
         progress("complete", "Đã lưu khoảng khả nghi và điểm theo thời gian")
         return report
 

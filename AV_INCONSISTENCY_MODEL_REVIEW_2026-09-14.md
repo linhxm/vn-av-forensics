@@ -1,74 +1,58 @@
-# Phát hiện và định vị bất nhất âm thanh-chuyển động môi
+# Phát hiện và định vị bất nhất âm thanh–chuyển động môi
 
-## 1. Bài toán
+## 1. Phạm vi hai nhánh
 
-**Input:** video một người, có audio và thấy rõ miệng. **Output:** khoảng khả nghi, điểm bất nhất theo cửa sổ/clip, độ lệch và mức đủ bằng chứng. Mục tiêu cuối là tiếng Việt; có thể thử trên GRID tiếng Anh trước.
+Input: video một người nói, có audio và thấy rõ miệng. Output: điểm/khoảng lệch thời gian và điểm/khoảng bất nhất môi–âm thanh còn lại sau khi xét căn chỉnh hợp lý. Không kết luận thật/giả, kỹ thuật chỉnh sửa, âm vị cụ thể hay danh tính người nói.
 
-| Hiện tượng | Thành phần xử lý |
-|---|---|
-| Global lag - audio nhanh/chậm cố định | Đo lag theo cửa sổ, tổng hợp mức đồng thuận trên clip |
-| Local lag - chỉ lệch ở một số đoạn | Cùng nhánh timing, giữ độ lệch và ranh giới theo thời gian |
-| Phoneme-viseme mismatch - âm không phù hợp khẩu hình | Nhánh phát âm-khẩu hình; cần nhãn sự kiện đã thẩm định |
-| Motion-speech mismatch - có lời nói nhưng miệng ít hoạt động/sai nhịp | Nhánh hoạt động audio, hoạt động miệng và mức tương ứng |
-| Sequence mismatch - miệng thuộc câu/âm khác | So chuỗi, xét nội dung còn bất nhất sau bù lag đáng tin |
-| Source/active speaker - tiếng có tương ứng người trong hình? | Nhánh đối sánh audio với face track |
-| Voice-face identity - giọng thuộc đúng danh tính? | Giữ yêu cầu nhưng chưa giải quyết; cần tham chiếu danh tính, hiện trả `not_assessed` |
+| Nhánh | Định nghĩa | Không đủ bằng chứng |
+|---|---|---|
+| timing | Ước lượng lag có dấu; tổng hợp global/local | Lag null, không tự quy thành mismatch |
+| lip_audio_mismatch | Audio không tương thích với chuyển động môi dù đã xét dịch thời gian hợp lý | Điểm được chấp nhận null; có thể xem chẩn đoán |
 
-Bất nhất không đồng nghĩa giả mạo: video thật lệch tiếng vẫn là mẫu bất nhất; video giả đồng bộ tốt có thể không có dấu hiệu này. Active speaker không chứng minh danh tính giọng nói.
+Sequence, phoneme–viseme và motion–speech được gộp thành mục tiêu mismatch chung. Đây là các biểu hiện/nhóm đánh giá, không còn ba head riêng. Source/identity được đưa ra ngoài phạm vi hiện tại.
 
-## 2. Pipeline đã chọn
+## 2. Kiến trúc
 
-Tổ chức thành hai project độc lập: **`data_pipeline`** tải/cắt/lọc/duyệt và xuất dataset; **`training_pipeline`** nhận dataset, chia tập, tạo biến thể, train và demo. Giao tiếp qua `vn-av-dataset-v1` gồm clip, manifest tương đối và mã kiểm tra nội dung. Việc tách folder không thay backbone hoặc phạm vi bài toán. [Hướng dẫn tổng thể](../../FILE_MAP_AND_RUN.md).
-
-**FATE → các nhánh quan hệ nhỏ → tổng hợp theo thời gian.**
-
-1. **Một backbone audio-visual: FATE**, tạo hai chuỗi đặc trưng audio và vùng mặt/miệng. Chọn công trình 2026 này vì có hướng dẫn dùng base `facebook/pe-av-small` + adapter `Guan123/fate` và đầu ra chuỗi. Checkpoint chưa được chứng minh đáp ứng sẵn toàn bộ bài toán. [Nguồn FATE](https://github.com/guankaisi/FATE).
-2. **Các nhánh dự đoán nhỏ dùng chung đặc trưng**, học timing, nội dung, hoạt động nói và tương ứng nguồn. Đây là phần phải huấn luyện riêng.
-3. **Bộ tổng hợp theo thời gian**, xuất khoảng khả nghi và điểm cửa sổ/clip; ngưỡng chọn trên validation.
-
-Nhiều loại bất nhất không đòi hỏi một model lớn cho mỗi loại. Các công trình khác ở mục 5 là tham khảo/đối chứng, không mặc định chạy nối tiếp FATE.
+**Một backbone FATE → hai head dùng chung đặc trưng → tổng hợp theo thời gian.**
 
 ```mermaid
-flowchart LR
-    I[Video + audio] --> P[Vùng mặt/miệng và timestamp]
-    P --> B[FATE: hai nhánh đặc trưng]
-    B --> H[Nhánh timing, nội dung, hoạt động và nguồn]
-    H --> T[Tổng hợp thời gian]
-    T --> O[Khoảng khả nghi + điểm bất nhất]
+flowchart TD
+    V[Video gốc] --> F[FATE: trích đặc trưng một lần]
+    F --> T[Timing: lag và confidence]
+    F --> M[Mismatch: cặp gốc + cặp căn chỉnh + confidence]
+    T --> A[Ghép đặc trưng khi lag đáng tin]
+    A --> M
+    T --> O[Điểm và khoảng theo thời gian]
+    M --> O
 ```
 
-**Nguyên tắc:** giữ timestamp gốc; lag dương nghĩa audio đi trước. Có trạng thái `no-match`; chỉ bù lag đáng tin để kiểm tra nội dung. Không suy độ chính xác định vị từ số token nội suy. Nhánh chưa học không tham gia score; vùng thiếu bằng chứng trả null, không nối khoảng qua vùng đó. Điểm bất nhất chưa phải xác suất giả mạo.
+FATE hiện tạo đặc trưng audio và crop khuôn mặt, chưa nhận dạng âm vị hay chuyển động môi riêng biệt. Giữ backbone này để thực nghiệm; số head giảm không chứng minh độ nhạy môi của đặc trưng đã đủ.
 
-## 3. Triển khai và giới hạn
+Lag dương nghĩa audio đi trước hình: A(t) đối chiếu V(t+k). Chỉ dịch chỉ mục đặc trưng, không sửa/encode lại video và không chạy FATE lần hai. Khi không căn chỉnh đáng tin, mismatch dùng cặp gốc với cờ confidence; chỉ được kết luận nếu kiểm tra validation riêng cho nhóm này đạt. Vùng thiếu bằng chứng không được nối khoảng qua.
 
-| Thành phần | Vị trí |
-|---|---|
-| Tải nguồn, cắt/lọc, duyệt | [Download/index](../../data_pipeline/src/vn_av_data/data/acquisition.py), [cắt/lọc](../../data_pipeline/src/vn_av_data/data/curation.py), [duyệt CSV](../../data_pipeline/src/vn_av_data/serving/review.py) |
-| Tải code/weights, chạy các bước | [Assets](../src/vn_av_training/assets.py), [pipeline](../src/vn_av_training/pipeline.py), [hướng dẫn](../../FILE_MAP_AND_RUN.md) |
-| Backbone và trích đặc trưng | [fate.py](../src/vn_av_training/features/fate.py) |
-| Các nhánh quan hệ và loss | [relations.py](../src/vn_av_training/models/relations.py) |
-| Tổng hợp khoảng/điểm | [relations.py](../src/vn_av_training/serving/relations.py) |
-| Dữ liệu, huấn luyện và đánh giá | [Dữ liệu](../src/vn_av_training/data/relations.py), [huấn luyện](../src/vn_av_training/training/relations.py), [đánh giá](../src/vn_av_training/evaluation/relations.py) |
-| Lệnh chạy và giao diện | [CLI](../src/vn_av_training/relation_cli.py), [giao diện kết quả](../demo/src/RelationResultView.tsx) |
+Cửa sổ 2 giây, bước 0,2 giây và 8 nhóm token là thiết lập tính toán, không phải độ chính xác định vị đã đo.
 
-Đã nối tải/index video dài → Silero VAD/cảnh/YuNet → cắt 3–8 giây → CSV duyệt → import/biến thể → cache → train/resume → đánh giá → demo MP4/API. Đã tải code và weights, nạp đủ tensor FATE và chạy forward trên clip thật; chưa huấn luyện/đánh giá detector trên toàn bộ dữ liệu thật. Clip mới qua lọc chất lượng chưa tự là nhãn khớp. Hướng dẫn chạy tập trung ở [FILE_MAP_AND_RUN.md](../../FILE_MAP_AND_RUN.md).
+## 3. Generator, nhãn và huấn luyện
 
-Bản v2 dùng cửa sổ 2 giây, bước 0,2 giây, giữ thứ tự 8 nhóm token thay cho trung bình cả cửa sổ. Tái dùng đặc trưng ảnh độc lập giữa các cửa sổ/mẫu chung hình; lớp thời gian vẫn chạy theo cửa sổ. Bước báo điểm và nhóm token chưa phải độ chính xác định vị đã đo. Chỉ xuất điểm nhánh đủ giám sát/validation hai lớp; nhãn thay câu không tự là nhãn sai khẩu hình; identity chưa giải quyết.
+Giữ ba folder độc lập: data thu clip sạch; generation chia nhóm rồi lưu MP4/nhãn; training chỉ nhận dataset đã tạo. [Lệnh chạy](README.md).
 
-## 4. Dữ liệu, huấn luyện và đánh giá
+Có năm kỹ thuật: global_lag, local_lag, sequence_swap, content_splice, motion_freeze; thêm clean đối chứng. Tạo đủ offset ±0,2/0,4/0,6/0,8 giây. Donor và mọi biến thể ở cùng split với nguồn; sạch và mẫu sửa encode cùng chính sách.
 
-**Dữ liệu mới:** bắt đầu từ YouTube → ứng viên → duyệt khớp → xuất dataset có phiên bản. Không giả định bộ tiếng Việt cũ còn tồn tại. Có thể thử một phần [GRID](https://zenodo.org/records/3625687) nếu cần; alignment từ không tự trở thành nhãn phoneme/viseme.
+Timing có offset đã biết ở vùng nguồn hợp lệ. Mismatch trên mẫu lag thuần túy là 0, tránh học nhầm timing thành nội dung. Thay câu/ghép audio/đóng băng chỉ có nhãn dương sau duyệt. Biên sửa, padding và nhãn chưa chắc được bỏ khỏi loss. Đóng băng toàn hình còn có nguy cơ tạo dấu hiệu dễ học; đo riêng từng kỹ thuật.
 
-Số mẫu/split được tính lại khi nhận từng dataset. Giữ clip cùng nguồn/người trong một tập, rồi mới tạo biến thể và chọn donor trong tập đó. Nhãn thay audio là giám sát tổng hợp cần thẩm định; nhánh thiếu mẫu dương giữ trạng thái chưa đánh giá. Không dùng số liệu của bộ cũ làm kết quả cho pipeline mới.
+Chuyển nhãn cũ: hợp các vùng positive sequence/phoneme_viseme/motion_speech; negative chỉ khi cả ba được xác nhận khớp hoặc nhãn chung đã được duyệt trực tiếp. Source không tham gia. Migration xuất manifest mới, không sửa video hay nhãn gốc.
 
-**Trình tự:** kiểm tra weights và chuẩn bị media → chia dữ liệu, tạo biến thể → cache đặc trưng → huấn luyện các nhánh trên Kaggle → chọn ngưỡng validation, đánh giá → phân tích video.
+Train một model: đóng băng FATE, cache đặc trưng; 3 epoch timing warmup rồi 20 epoch joint tối đa. Loss có trọng số cho timing và mismatch, bỏ nhãn -1. Không dùng căn chỉnh đáp án khi validation/test. Một checkpoint chứa cả hai head; best.pt chỉ chọn trong giai đoạn joint. Resume giữ trạng thái optimizer, phase và RNG.
 
-- Chia theo người/nguồn trước; donor và mọi biến thể ở cùng split. Mẫu lệch toàn clip/cục bộ có nhãn lag và ranh giới; mẫu cùng người khác câu kiểm tra nội dung. Giữ control đúng qua cùng xử lý nén/cắt ghép.
-- Đóng băng FATE để học các nhánh trước, chỉ fine-tune khi cần. Đo batch thật để chọn bộ nhớ/precision và lưu checkpoint để tiếp tục phiên Kaggle.
-- Nhãn thiếu không là âm tính. Khác âm/thanh điệu nhưng khẩu hình khó phân biệt phải đánh dấu mơ hồ. Transcript gốc dùng tạo nhãn, không làm đầu vào ngầm khi suy luận.
-- Báo MAE lag, định vị theo temporal IoU, precision/recall từng loại, tỷ lệ báo nhầm và coverage. Đánh giá riêng tiếng Việt trước khi kết luận cho tiếng Việt.
+## 4. Đánh giá và giới hạn
 
-**Hoàn thành bài toán:** có khoảng/điểm theo thời gian và kết quả kiểm chứng từng yêu cầu mục 1; ghi rõ phần chưa giải quyết. Chỉ đổi/thêm model khi có hạn chế kỹ thuật hoặc kết quả thực nghiệm cụ thể; ưu tiên công trình mới trong các lựa chọn phù hợp.
+Báo precision/recall/FAR, coverage, MAE lag, event F1 và kết quả từng generator. Chọn threshold trên validation; không chỉnh ngưỡng theo test. Model phải vượt kiểm tra chất lượng trước khi góp vào kết luận demo.
+
+Test bằng nguồn/người mới, video thật khớp/lệch tự nhiên và bất nhất khó chưa gặp. Có thể thử GRID trước; kết quả tiếng Anh chưa chứng minh cho tiếng Việt. Hai cửa sổ chồng nhau không phải hai mẫu thống kê độc lập.
+
+Checkpoint năm head cũ chỉ là kết quả lịch sử, không tương thích với checkpoint fate-two-heads-v1. Phải tạo hoặc migrate dataset rồi train mới. Code chạy và kiểm thử phần mềm đạt không thay thế việc đo hiệu quả detector.
+
+Các công trình dưới đây giữ lại từ khảo sát trước, chưa được xác minh lại trong lần sửa code này. Các hướng active-speaker/identity nằm ngoài phạm vi hai nhánh hiện tại.
 
 ## 5. Kiến trúc chưa triển khai - giữ để tích hợp sau
 

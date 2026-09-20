@@ -1,4 +1,4 @@
-"""Frozen-encoder feature detector: fusion TCN, temporal relation and phoneme ablations."""
+"""Masked temporal building blocks for the two-head model."""
 
 from __future__ import annotations
 
@@ -32,74 +32,3 @@ class TemporalBlock(nn.Module):
     def forward(self, x, valid):
         y = self.conv(x.transpose(1, 2)).transpose(1, 2)
         return (x + self.dropout(F.gelu(self.norm(y)))) * valid[..., None]
-
-
-class Detector(nn.Module):
-    def __init__(
-        self,
-        audio_dim=768,
-        visual_dim=768,
-        projection=256,
-        hidden=128,
-        dilations=(1, 2, 4),
-        dropout=0.1,
-        modality="av",
-        temporal=False,
-        radius=5,
-        phoneme=False,
-    ):
-        super().__init__()
-        if modality not in ("audio", "visual", "av") or radius < 0:
-            raise ValueError("Invalid modality/radius")
-        if (temporal or phoneme) and modality != "av":
-            raise ValueError("Temporal/phoneme branches require both modalities")
-        self.config = dict(
-            audio_dim=audio_dim,
-            visual_dim=visual_dim,
-            projection=projection,
-            hidden=hidden,
-            dilations=list(dilations),
-            dropout=dropout,
-            modality=modality,
-            temporal=temporal,
-            radius=radius,
-            phoneme=phoneme,
-        )
-        self.audio = nn.Sequential(nn.Linear(audio_dim, projection), nn.LayerNorm(projection))
-        self.visual = nn.Sequential(nn.Linear(visual_dim, projection), nn.LayerNorm(projection))
-        width = projection * (2 if modality == "av" else 1)
-        width += 2 * (2 * radius + 1) if temporal else 0
-        width += 3 if phoneme else 0
-        self.input = nn.Linear(width, hidden)
-        self.blocks = nn.ModuleList(TemporalBlock(hidden, d, dropout) for d in dilations)
-        self.clip = nn.Linear(hidden, 1)
-        self.forgery = nn.Linear(hidden, 1) if temporal else None
-        self.mismatch = nn.Linear(hidden, 1) if temporal else None
-
-    def forward(self, batch):
-        c = self.config
-        am = batch["audio_valid"].bool() & batch["padding_valid"]
-        vm = batch["visual_valid"].bool() & batch["padding_valid"]
-        a = self.audio(batch["audio"].float()) * am[..., None]
-        v = self.visual(batch["visual"].float()) * vm[..., None]
-        valid = am if c["modality"] == "audio" else vm if c["modality"] == "visual" else am & vm
-        features = [a] if c["modality"] == "audio" else [v] if c["modality"] == "visual" else [a, v]
-        lag_score = lag_mask = None
-        if c["temporal"]:
-            lag_score, lag_mask = correspondence(a, v, am, vm, c["radius"])
-            features.extend([lag_score, lag_mask.float()])
-        if c["phoneme"]:
-            pm = batch["phoneme_valid"].bool() & valid
-            features.extend([batch["phoneme"].float() * pm[..., None], pm[..., None].float()])
-        x = F.gelu(self.input(torch.cat(features, -1))) * valid[..., None]
-        for block in self.blocks:
-            x = block(x, valid)
-        pooled = x.sum(1) / valid.sum(1, keepdim=True).clamp_min(1)
-        return {
-            "clip": self.clip(pooled).squeeze(-1),
-            "valid": valid,
-            "forgery": self.forgery(x).squeeze(-1) if self.forgery else None,
-            "mismatch": self.mismatch(x).squeeze(-1) if self.mismatch else None,
-            "lag_score": lag_score,
-            "lag_mask": lag_mask,
-        }

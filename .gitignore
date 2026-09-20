@@ -38,3 +38,6 @@ vn-av-forensics-training/demo/vite.config.d.ts
 **/.test-*/
 **/build/
 **/pytest-cache-files-*/
+vn-av-forensics-generation/datasets/
+vn-av-forensics-generation/plans/
+vn-av-forensics-generation/outputs/

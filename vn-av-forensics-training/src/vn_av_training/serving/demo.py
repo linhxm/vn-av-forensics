@@ -22,7 +22,7 @@ if(job.status==='complete'){show(job);break}await new Promise(resolve=>setTimeou
 }catch(e){$('status').textContent=e.message}finally{$('submit').disabled=false}}
 function show(job){report=job.result;$('score').textContent='Điểm clip: '+(report.clip_inconsistency_score?.toFixed(3)??'Không đủ bằng chứng');
 $('coverage').textContent='Độ phủ: '+JSON.stringify(report.coverage);
-$('heads').textContent='Trạng thái các nhánh: '+JSON.stringify(report.head_availability,null,2)+'\\nDanh tính: '+report.identity_status;
+$('heads').textContent='Trạng thái các nhánh: '+JSON.stringify(report.head_availability,null,2);
 $('intervals').replaceChildren();for(let span of report.suspicious_intervals){let li=document.createElement('li'),b=document.createElement('button');
 b.textContent=`${span.start.toFixed(2)}–${span.end.toFixed(2)} s · ${span.relation}`;
 b.onclick=()=>{$('video').currentTime=span.start;$('video').play()};li.append(b);$('intervals').append(li)}

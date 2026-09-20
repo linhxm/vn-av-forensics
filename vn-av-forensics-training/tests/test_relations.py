@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from vn_av_training.features.fate import FATEBackbone, asset_signature
+from vn_av_training.features.signature import portable_encoder_signature
 from vn_av_training.models.detector import correspondence
 from vn_av_training.models.relations import RELATIONS, RelationHeads, relation_loss
 from vn_av_training.serving.relations import RelationPipeline, aggregate_relations
@@ -43,29 +44,19 @@ def test_heads_train_with_partial_labels_and_invalid_cells():
     data["visual_valid"][:, -2:] = False
     data["visual"][:, -2:] = float("nan")
     targets = {name: torch.randint(0, 2, (1, 12)) for name in RELATIONS}
-    targets["phoneme_viseme"][:] = -1
     targets["lag_class"] = torch.full((1, 12), 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-    before = model.heads["sequence"].weight.detach().clone()
+    before = model.heads["lip_audio_mismatch"].weight.detach().clone()
     output = model(data)
     loss, losses = relation_loss(output, targets)
     assert torch.isfinite(loss)
-    assert "phoneme_viseme" not in losses
+    assert "lip_audio_mismatch" in losses
     assert "timing" in losses
     loss.backward()
     optimizer.step()
-    assert not torch.equal(before, model.heads["sequence"].weight)
+    assert not torch.equal(before, model.heads["lip_audio_mismatch"].weight)
     assert model.audio[0].weight.grad is not None
     assert not output["valid"][0, -2:].any()
-
-
-def test_activity_streams_are_independent():
-    model = RelationHeads(8, 8, projection=8, hidden=8, radius=1).eval()
-    data = batch()
-    first = model(data)
-    data["audio"] = torch.randn_like(data["audio"]) * 3
-    second = model(data)
-    torch.testing.assert_close(first["logits"]["visual_speech"], second["logits"]["visual_speech"])
 
 
 def test_null_match_and_empty_evidence():
@@ -80,7 +71,11 @@ def test_null_match_and_empty_evidence():
     data["audio_valid"][:] = False
     output = model(data)
     result = aggregate_relations(
-        output, np.arange(12) * 0.04, 0.04, {"timing": 0.5, "sequence": 0.5}, ("timing", "sequence")
+        output,
+        np.arange(12) * 0.04,
+        0.04,
+        {"timing": 0.5, "lip_audio_mismatch": 0.5},
+        ("timing", "lip_audio_mismatch"),
     )
     assert result["status"] == "not_assessable"
     assert result["clip_inconsistency_score"] is None
@@ -109,7 +104,7 @@ def evidence():
 
 def test_intervals_break_at_missing_data_and_untrained_heads_are_excluded():
     result = aggregate_relations(
-        evidence(), np.arange(8) * 0.04, 0.04, {"sequence": 0.5}, ("sequence",)
+        evidence(), np.arange(8) * 0.04, 0.04, {"lip_audio_mismatch": 0.5}, ("lip_audio_mismatch",)
     )
     intervals = result["suspicious_intervals"]
     np.testing.assert_allclose(
@@ -117,8 +112,8 @@ def test_intervals_break_at_missing_data_and_untrained_heads_are_excluded():
     )
     assert result["window_scores"][4]["inconsistency_score"] is None
     assert result["global_lag_ms"] is None
-    assert result["head_availability"]["phoneme_viseme"] == "untrained"
-    assert result["identity_status"] == "not_assessed"
+    assert result["head_availability"]["timing"] == "untrained"
+    assert result["scope"] == ["timing", "lip_audio_mismatch"]
     assert result["status"] == "partial"
 
 
@@ -133,11 +128,11 @@ def test_global_lag_retains_original_timing_and_local_variation():
 def test_unknown_labels_are_not_negatives_and_bad_timestamps_fail():
     output = RelationHeads(8, 8, projection=8, hidden=8, radius=1)(batch())
     with pytest.raises(ValueError, match="No observed"):
-        relation_loss(output, {"sequence": torch.full((1, 12), -1)})
+        relation_loss(output, {"lip_audio_mismatch": torch.full((1, 12), -1)})
     with pytest.raises(ValueError, match="uniform"):
         aggregate_relations(output, np.arange(12) ** 2, 0.04, {}, ())
     with pytest.raises(ValueError, match="threshold"):
-        aggregate_relations(output, np.arange(12) * 0.04, 0.04, {}, ("sequence",))
+        aggregate_relations(output, np.arange(12) * 0.04, 0.04, {}, ("lip_audio_mismatch",))
 
 
 class FakeUpstream(nn.Module):
@@ -165,8 +160,8 @@ def test_three_parts_compose_and_keep_backbone_frozen():
     with pytest.raises(ValueError, match="Train relation"):
         pipeline.analyze(inputs, metadata, 0.04)
     # Availability here is solely a fixture to exercise integration, not a trained model claim.
-    pipeline.trained_heads = ("sequence",)
-    pipeline.thresholds = {"sequence": 0.5}
+    pipeline.trained_heads = ("lip_audio_mismatch",)
+    pipeline.thresholds = {"lip_audio_mismatch": 0.5}
     result = pipeline.analyze(inputs, metadata, 0.04)
     assert len(result["window_scores"]) == 12
     assert result["head_availability"]["timing"] == "untrained"
@@ -177,3 +172,31 @@ def test_missing_fate_assets_fail_before_import_or_download():
     missing = Path(__file__).parent / ("missing-fate-" + uuid4().hex)
     with pytest.raises(FileNotFoundError, match="FATE source"):
         asset_signature(missing / "repo", missing / "base", missing / "adapter")
+
+
+def test_portable_encoder_signature_normalizes_text_and_ignores_cache(tmp_path):
+    repo = tmp_path / "repo"
+    base = tmp_path / "base"
+    adapter = tmp_path / "adapter"
+    source = repo / "models/pe_av"
+    source.mkdir(parents=True)
+    base.mkdir()
+    adapter.mkdir()
+    (source / "modeling_pe_audio_video.py").write_bytes(b"first\r\nsecond\r\n")
+    (base / "config.json").write_bytes(b'{\r\n  "model": "pe-av"\r\n}\r\n')
+    (base / "model.safetensors").write_bytes(b"base-weights")
+    (adapter / "adapter_config.json").write_bytes(b'{\r\n  "type": "lora"\r\n}\r\n')
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter-weights")
+    face = tmp_path / "face.onnx"
+    face.write_bytes(b"face-model")
+    cfg = {"repo": repo, "base": base, "adapter": adapter, "face_model": face}
+
+    expected = portable_encoder_signature(cfg)
+    (source / "modeling_pe_audio_video.py").write_bytes(b"first\nsecond\n")
+    (base / "config.json").write_bytes(b'{\n  "model": "pe-av"\n}\n')
+    (adapter / "adapter_config.json").write_bytes(b'{\n  "type": "lora"\n}\n')
+    cache = base / ".cache/huggingface/trees"
+    cache.mkdir(parents=True)
+    (cache / "revision.json").write_text('{"machine": "local-only"}', encoding="utf-8")
+
+    assert portable_encoder_signature(cfg) == expected

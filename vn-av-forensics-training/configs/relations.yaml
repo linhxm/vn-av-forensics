@@ -1,12 +1,12 @@
 pipeline: relations
 seed: 42
 device: cuda
-dataset: datasets/dataset_v001
-clean_manifest: datasets/manifests/v001-clean.jsonl
-manifest: datasets/manifests/v001-controls.jsonl
-cache: cache/fate-v001
-output: runs/fate-v001
-checkpoint: runs/fate-v001/best.pt
+dataset: datasets/relations_two_head_v1
+dataset_manifest: manifest-reviewed.jsonl
+manifest: datasets/manifests/two-head-v1.jsonl
+cache: cache/fate-two-head-v1
+output: runs/fate-two-head-v1
+checkpoint: runs/fate-two-head-v1/best.pt
 encoder:
   repo: external/FATE
   base: checkpoints/pe-av-small
@@ -28,7 +28,16 @@ model:
   dropout: 0.1
   lag_confidence: 0.5
 training:
-  epochs: 20
+  required_heads: [timing, lip_audio_mismatch]
+  quality:
+    max_false_alarm_rate: 0.05
+    min_precision: 0.5
+    min_recall: 0.1
+    min_auroc: 0.6
+    min_windows_per_class: 20
+  timing_warmup_epochs: 3
+  loss_weights: {timing: 1.0, lip_audio_mismatch: 1.0}
+  epochs: 23
   lr: 0.0003
   weight_decay: 0.0001
   accumulation: 8

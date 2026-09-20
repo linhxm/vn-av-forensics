@@ -290,7 +290,6 @@ class FATEVideoEncoder:
                 "implementation": {
                     "encoder": sha(__file__),
                     "media": sha(Path(__file__).parents[1] / "data/media.py"),
-                    "variants": sha(Path(__file__).parents[1] / "data/relations.py"),
                     "face": sha(Path(__file__).with_name("face.py")),
                 },
                 "format": "fate-window-v1",
@@ -318,6 +317,8 @@ class FATEVideoEncoder:
 
     @torch.no_grad()
     def extract(self, row, output):
+        if row.get("variant", {"kind": "clean"}) != {"kind": "clean"}:
+            raise ValueError("Render media in the generation project before extraction")
         output = Path(output)
         source = self.source_fingerprint(row)
         if output.is_file() and output.with_suffix(".json").is_file():
@@ -329,11 +330,6 @@ class FATEVideoEncoder:
             ):
                 return meta
         decoded = self.decode(row["video"])
-        donor_path = row.get("variant", {}).get("donor")
-        donor = self.decode(donor_path) if donor_path else None
-        from vn_av_training.data.relations import apply_variant
-
-        decoded = apply_variant(decoded, row.get("variant", {"kind": "clean"}), donor)
         crops, seen = self.cropper(decoded["frames"])
         visual_source = fingerprint({"video": sha(row["video"]), "encoder": self.signature})
         n = len(crops)

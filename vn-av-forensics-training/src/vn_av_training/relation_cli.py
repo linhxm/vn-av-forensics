@@ -8,7 +8,8 @@ from vn_av_training.common.runtime import load_config
 COMMANDS = (
     "validate",
     "import",
-    "controls",
+    "audit",
+    "checkpoint-info",
     "doctor",
     "prepare",
     "train",
@@ -37,11 +38,9 @@ def main(argv):
             command.add_argument("--skip-evaluation", action="store_true")
         if name in ("relations-import", "relations-validate"):
             command.add_argument("--dataset")
+            command.add_argument("--dataset-manifest")
             if name == "relations-import":
                 command.add_argument("--output")
-        elif name == "relations-controls":
-            command.add_argument("--manifest")
-            command.add_argument("--output")
         elif name == "relations-train":
             command.add_argument("--resume", action="store_true")
         elif name == "relations-doctor":
@@ -55,18 +54,50 @@ def main(argv):
     args = parser.parse_args(argv)
     args.command = "relations-" + args.command.removeprefix("relations-")
     cfg = load_config(args.config, args.profile)
+    if args.command in ("relations-prepare", "relations-run"):
+        from vn_av_training.data.generated import supervision_report
+
+        supervision_report(cfg, enforce=True)
     result, status = None, 0
     if args.command == "relations-import":
-        from vn_av_training.data.bundle import import_bundle
+        from vn_av_training.data.generated import import_generated
 
-        result = import_bundle(
-            args.dataset or cfg["dataset"], args.output or cfg["clean_manifest"], cfg["seed"]
+        result = import_generated(
+            args.dataset or cfg["dataset"],
+            args.output or cfg["manifest"],
+            args.dataset_manifest or cfg.get("dataset_manifest", "manifest.jsonl"),
+            cfg,
         )
     elif args.command == "relations-validate":
-        from vn_av_training.contract import validate_bundle
-        from vn_av_training.data.media import probe
+        from vn_av_training.data.generated import validate_generated
 
-        _, result = validate_bundle(args.dataset or cfg["dataset"], probe=probe)
+        _, result = validate_generated(
+            args.dataset or cfg["dataset"],
+            args.dataset_manifest or cfg.get("dataset_manifest", "manifest.jsonl"),
+            cfg,
+        )
+    elif args.command == "relations-audit":
+        from vn_av_training.data.generated import supervision_report
+
+        result = supervision_report(cfg)
+        status = 1 if result["missing_required_heads"] else 0
+    elif args.command == "relations-checkpoint-info":
+        from vn_av_training.training.quality import head_status
+        from vn_av_training.training.relations import load_relations
+
+        _, state = load_relations(cfg["checkpoint"])
+        result = {
+            key: state.get(key)
+            for key in (
+                "active_heads",
+                "trained_heads",
+                "deployable_heads",
+                "thresholds",
+                "validation_report",
+                "label_coverage",
+            )
+        }
+        result["head_status"] = head_status(state)
     elif args.command == "relations-setup":
         from vn_av_training.assets import setup_assets
 
@@ -75,15 +106,6 @@ def main(argv):
         from vn_av_training.pipeline import train_pipeline
 
         result = train_pipeline(cfg, args.resume, not args.skip_evaluation)
-    elif args.command == "relations-controls":
-        from vn_av_training.data.relations import make_controls
-
-        result = make_controls(
-            args.manifest or cfg["clean_manifest"],
-            args.output or cfg["manifest"],
-            cfg["encoder"]["step_s"],
-            cfg["model"]["radius"],
-        )
     elif args.command == "relations-prepare":
         from vn_av_training.features.fate import prepare_relations
 
@@ -113,6 +135,11 @@ def main(argv):
             encoder = FATEVideoEncoder(cfg["encoder"])
             result["backbone_loaded"] = True
             result["feature_signature"] = encoder.signature
+            if args.stage == "inference":
+                from vn_av_training.serving.relations import RelationAnalyzer
+
+                RelationAnalyzer(cfg, encoder=encoder)
+                result["checkpoint_loaded"] = True
         status = 0 if ready else 1
     elif args.command == "relations-serve":
         import uvicorn

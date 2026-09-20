@@ -1,210 +1,156 @@
-# Hướng dẫn chạy VN-AV Forensics
+# VN-AV Forensics
 
-`vn-av-forensics-data`: tải, cắt, duyệt và xuất dataset; không cần GPU. `vn-av-forensics-training`: train, đánh giá, API và demo; Kaggle dùng GPU, máy local có thể chạy inference bằng CPU.
+Hai nhánh cho video một người nói, có audio và thấy rõ miệng:
 
-Quy trình gồm ba phần:
+- **timing:** ước lượng độ lệch có dấu, phát hiện lệch toàn clip/cục bộ.
+- **lip_audio_mismatch:** bất nhất môi–âm thanh còn lại sau khi xét căn chỉnh thời gian hợp lý.
 
-1. Tải video YouTube, cắt clip và duyệt dữ liệu trên máy cá nhân.
-2. Upload dataset lên Kaggle, dùng GPU để trích đặc trưng và train.
-3. Tải checkpoint về máy, chạy API và frontend để demo.
+Một backbone FATE dùng chung, một model hai head và một checkpoint. Demo không sửa video: chỉ ghép đặc trưng ở các thời điểm tương ứng. Không phân loại kỹ thuật giả mạo, âm vị cụ thể hay danh tính giọng–mặt.
+
+## Ba folder
 
 ```text
-YouTube -> vn-av-forensics-data -> dataset_v001
-        -> Kaggle / vn-av-forensics-training -> best.pt
-        -> API FastAPI + frontend React -> http://127.0.0.1:8000
+vn-av-forensics-data        YouTube → tải → cắt/lọc → duyệt clip sạch
+vn-av-forensics-generation  chia nhóm → clean + 5 kỹ thuật → duyệt → lưu MP4/nhãn
+vn-av-forensics-training    cache FATE → warmup timing → học chung → đánh giá → demo
 ```
 
-## 1. Tải và chuẩn bị dữ liệu trên máy local
+[Tài liệu kiến trúc và các công trình tham khảo](AV_INCONSISTENCY_MODEL_REVIEW_2026-09-14.md).
 
-### 1.1. Cài pipeline dữ liệu
+## 1. Tạo dữ liệu sạch
+
+Từ gốc repo, Anaconda Prompt; cài Git và Node.js vào PATH:
 
 ```powershell
 conda create -n vn-av-data python=3.11 -y
 conda activate vn-av-data
-cd .\vn-av-forensics-data
+cd vn-av-forensics-data
 python -m pip install -e .
 python -m vn_av_data setup
 ```
 
-Lệnh `setup` tải Silero VAD và YuNet vào `checkpoints/media/`. FFmpeg được cung cấp qua `imageio-ffmpeg`.
-
-### 1.2. Khai báo video nguồn
-
-Tạo file `vn-av-forensics-data/data/sources.csv` với mã hóa UTF-8:
-
-```csv
-url,speaker_id
-https://www.youtube.com/watch?v=VIDEO_ID_1,speaker_01
-https://www.youtube.com/watch?v=VIDEO_ID_2,speaker_02
-https://www.youtube.com/watch?v=VIDEO_ID_3,speaker_03
-```
-
-Quy ước dữ liệu:
-
-- Không nhập URL playlist.
-- Các video của cùng một người phải dùng cùng `speaker_id`.
-- Nên chọn video một người nói, thấy rõ mặt và miệng, ít chuyển cảnh, không lồng tiếng.
-- Dataset train cần ít nhất ba nhóm nguồn/người độc lập để tạo đủ train, validation và test.
-
-### 1.3. Tải video
+Tạo `data/sources/dataset_v002/videos.csv` theo [CSV mẫu](vn-av-forensics-data/configs/videos.example.csv), điền URL thật và speaker_id nhất quán. Phiên bản/đợt tải đặt trong `steps/settings.py`.
 
 ```powershell
-python -m vn_av_data download --sources data/sources.csv --output data/raw
+python steps/01_collect.py
+python steps/02_download.py
+python steps/03_cut.py
+python steps/04_merge_manifest.py
+python steps/05_review.py
 ```
 
-Kết quả chính là video trong `data/raw/` và manifest `data/raw/sources.jsonl`. Nếu bị gián đoạn, chạy lại cùng lệnh; lỗi tải được ghi trong `data/raw/download-errors.json`.
-
-Nếu đã có video trên máy, chép video vào `data/raw/` rồi dùng lệnh sau thay cho `download`:
+Mở http://127.0.0.1:8001, duyệt keep/reject/uncertain và xác nhận tiếng–hình khớp. Dừng bằng Ctrl+C rồi:
 
 ```powershell
-python -m vn_av_data index --root data/raw --output data/raw/sources.jsonl
+python steps/06_export.py
+python -m vn_av_data validate --dataset exports/dataset_v002
 ```
 
-Không chạy đồng thời cả `download` và `index` cho cùng một đợt dữ liệu.
+Tải theo batch có snapshot nguồn và trạng thái để resume; chạy lại lệnh download bỏ qua file đã xác minh. Có thể thêm `--limit 2`, `--dry-run` hoặc `--cookies-from-browser edge --force-ipv4`. Cut chặn batch chưa tải xong. Giữ nhiều nhóm nguồn/người độc lập; cùng người phải cùng speaker_id. Tối thiểu ba nhóm để chia train/validation/test. Không còn yêu cầu donor khác người trong từng split.
 
-### 1.4. Cắt video thành clip ứng viên
+## 2. Tạo dataset bất nhất
+
+| Kỹ thuật | Nhãn timing | Nhãn mismatch |
+|---|---|---|
+| clean (đối chứng) | 0 | 0 |
+| global_lag | Offset đã biết | 0 ở cửa sổ còn đủ nội dung nguồn |
+| local_lag | Offset từng đoạn | 0 tại cửa sổ không vắt qua biên |
+| sequence_swap | Chưa biết trong đoạn thay | Duyệt bất nhất khi thay câu |
+| content_splice | Chưa biết trong đoạn thay | Duyệt bất nhất khi ghép đoạn lời |
+| motion_freeze | Chưa biết trong đoạn đóng băng | Duyệt có lời nói nhưng môi đứng |
+
+Bỏ source_swap. Generator tạo đủ ±0,2/0,4/0,6/0,8 giây; sạch là lớp 0. Nhãn mismatch: 1 có bất nhất, 0 đã xác nhận tương thích, -1 chưa biết/không tính loss. Tên generator không tự là nhãn dương. Đứng hình toàn khung là mẫu dễ có dấu hiệu phụ, phải báo kết quả riêng từng kỹ thuật.
+
+Chia nhóm nguồn/người trước tạo biến thể; donor không vượt split. Sạch và bất nhất cùng chính sách encode. File MP4, hash, nguồn, split và nhãn được lưu để train nhiều lần.
+
+**Kaggle:** upload dataset sạch; mở [generate_relations.ipynb](vn-av-forensics-generation/notebooks/generate_relations.ipynb), sửa YOUR_CLEAN_DATASET, bật Internet, chạy CPU. Tải `relations_two_head_v1.zip` rồi giải nén vào `vn-av-forensics-generation/outputs/`.
+
+**Hoặc tạo local**, từ folder generation:
 
 ```powershell
-python -m vn_av_data cut --manifest data/raw/sources.jsonl --output data/candidates/v001
+conda activate vn-av-data
+python -m pip install -e .
+python -m vn_av_generation plan --dataset ../vn-av-forensics-data/exports/dataset_v002 --output plans/plan_two_head_v1.json
+python -m vn_av_generation render --dataset ../vn-av-forensics-data/exports/dataset_v002 --plan plans/plan_two_head_v1.json --output outputs/relations_two_head_v1
 ```
 
-Mặc định pipeline dùng VAD, kiểm tra chuyển cảnh và phát hiện mặt để tạo clip dài khoảng 3-8 giây. Kết quả nằm trong `data/candidates/v001/`; xem `summary.json`, `errors.json` và `rejected.json` để kiểm tra đợt xử lý.
-
-### 1.5. Duyệt clip thủ công
+Duyệt chung nhãn môi–âm thanh:
 
 ```powershell
-python -m vn_av_data review --review data/candidates/v001/review.csv --root data/candidates/v001
+python -m vn_av_generation review --dataset outputs/relations_two_head_v1
 ```
 
-Mở [http://127.0.0.1:8001](http://127.0.0.1:8001). Với mỗi clip:
-
-- Chọn `keep` khi chỉ có người cần thu, thấy rõ miệng, âm thanh đúng người và hình-tiếng khớp tự nhiên.
-- Chọn `reject` nếu clip lỗi, nhiều người, che miệng, lồng tiếng hoặc lệch tiếng-hình.
-- Chọn `uncertain` nếu chưa chắc chắn.
-
-Quyết định được lưu vào `review.csv`. Nhấn `Ctrl+C` tại PowerShell để dừng server.
-
-### 1.6. Xuất và kiểm tra dataset
+Mở http://127.0.0.1:8002. Positive chỉ khi quan sát bất nhất không giải thích được bằng dịch thời gian hợp lý; uncertain nếu chưa rõ. Sửa khoảng đúng theo video. Dừng server rồi:
 
 ```powershell
-python -m vn_av_data export --review data/candidates/v001/review.csv --root data/candidates/v001 --output exports/dataset_v001 --dataset-id dataset_v001
-
-python -m vn_av_data validate --dataset exports/dataset_v001
+python -m vn_av_generation finalize --dataset outputs/relations_two_head_v1 --review outputs/relations_two_head_v1/review.csv --output outputs/relations_two_head_v1/manifest-reviewed.jsonl
+python -m vn_av_generation inspect --dataset outputs/relations_two_head_v1 --manifest manifest-reviewed.jsonl
 ```
 
-Chỉ các clip được duyệt `keep` mới được xuất. Cấu trúc đầu ra:
+Giữ toàn bộ folder: clips/, manifest.jsonl, dataset_info.json, generation.json, review.csv, manifest-reviewed.jsonl và manifest-reviewed.info.json. Upload thành Kaggle Dataset. Render lại cùng code/plan/output sẽ xác minh rồi bỏ qua mẫu xong; đổi code/plan cần output mới.
+
+### Dùng lại video đã tạo theo năm head
+
+Không cần render lại nếu đã có MP4. Từ folder generation, thay đường dẫn bằng dataset thực tế:
+
+```powershell
+python -m vn_av_generation migrate --dataset outputs/relations_v002 --manifest manifest-reviewed.jsonl --output outputs/relations_v002/manifest-two-heads.jsonl
+```
+
+Lệnh tạo manifest/receipt mới, giữ video và nhãn gốc. Positive ở một trong sequence/phoneme_viseme/motion_speech trở thành positive chung. Negative chỉ hợp lệ khi đủ ba loại được xác nhận âm tính; phần còn lại chưa biết. Source_swap bị loại khỏi manifest mới, không xóa video. Mẫu lag thuần túy làm negative mismatch ở vùng hợp lệ.
+
+Trong notebook train, đặt DATASET tới folder cũ và MANIFEST thành `manifest-two-heads.jsonl`. Audit sẽ báo thiếu nhãn nếu cần duyệt/bổ sung dữ liệu. Data cũ chỉ có ±0,2/±0,8 vẫn dùng được nhưng chưa phủ đủ lưới; nên tạo phiên bản mới đủ offset. Manifest control ảo cũ chưa có MP4 phải đi qua generator mới.
+
+## 3. Train hai head trên Kaggle
+
+Hai notebook clone repo GitHub: cần đưa code mới lên repo trước, hoặc upload code và sửa đường dẫn. Thay đổi local không tự lên GitHub.
+
+Mở [train_fate_relations.ipynb](vn-av-forensics-training/notebooks/train_fate_relations.ipynb), thêm dataset đã duyệt, sửa DATASET/MANIFEST, bật GPU và Internet:
 
 ```text
-vn-av-forensics-data/exports/dataset_v001/
-|-- clips/
-|-- manifest.jsonl
-|-- dataset_info.json
-`-- quality_report.json
+validate → import → audit → setup → doctor → prepare → train → evaluate → checkpoint-info
 ```
 
-Không sửa trực tiếp một dataset đã xuất. Khi thay nguồn hoặc nhãn, xuất một phiên bản mới như `dataset_v002`.
+Import giữ nguyên split, kiểm tra hash và nhãn. Prepare chỉ đọc video đã render, không tạo bất nhất lần nữa. Setup tải code/weights FATE và YuNet. FATE đóng băng; cache đặc trưng dùng lại giữa các epoch.
 
-## 2. Train FATE Relation Detector trên Kaggle
+Một lệnh train chạy 23 epoch tối đa: **3 epoch warmup timing + 20 epoch học chung hai head**. Warmup chưa xuất best.pt dùng demo. Hai giai đoạn dùng cùng model/optimizer; validation/test luôn dùng lag dự đoán, không lấy lag đáp án để căn chỉnh hộ. Resume bằng `python -m vn_av_training train --resume` khi còn last.pt và cấu hình/data không đổi.
 
-Toàn bộ code dùng trên Kaggle nằm trong notebook [train_fate_relations.ipynb](vn-av-forensics-training/notebooks/train_fate_relations.ipynb). Phần này chỉ hướng dẫn thứ tự chuẩn bị và chạy notebook.
+Train yêu cầu hai lớp dùng được cho cả hai head trong train và validation. Nhãn thiếu không là negative. Threshold chọn trên validation với giới hạn FAR/precision/recall/AUROC; timing kiểm tra thêm coverage và MAE. Khi lag chưa chắc, mismatch chỉ được đưa ra kết luận nếu nhóm validation tương ứng đã đạt kiểm tra riêng. Nếu không, trả null; điểm thô vẫn xem được ở chế độ chẩn đoán.
 
-### 2.1. Chuẩn bị repo và dataset
+Kết quả: `runs/fate-two-head-v1/`, cache: `cache/fate-two-head-v1/`. Xem history.json (phase), validation-report.json và evaluation-test/metrics.json, gồm kết quả theo kỹ thuật. Kiểm thử phần mềm không chứng minh độ chính xác trên video thật; cần đánh giá nguồn/người mới và tiếng Việt riêng.
 
-Push toàn bộ repo lên [linhxm/vn-av-forensics](https://github.com/linhxm/vn-av-forensics). Repo chứa code của pipeline chuẩn bị dữ liệu và pipeline training; dữ liệu sinh ra, checkpoint, cache và kết quả train không được đẩy lên GitHub vì đã nằm trong `.gitignore`.
+**Weight năm head cũ không tương thích.** Cần train checkpoint định dạng fate-two-heads-v1; không đổi tên weight cũ để nạp. Cache trích đặc trưng mới nằm ở thư mục riêng do đường xử lý đã đổi; không ghi đè cache/run cũ. Tải ZIP artifact cuối notebook; giữ thêm cache nếu muốn train lại không trích đặc trưng.
 
-Upload thư mục `dataset_v001/` đã xuất thành một Kaggle Dataset riêng. Khi tạo Kaggle Notebook:
+## 4. Demo: backend Anaconda + frontend terminal
 
-1. Thêm Kaggle Dataset chứa `dataset_v001/` vào mục **Input**.
-2. Chọn GPU trong **Accelerator**.
-3. Bật **Internet** để notebook clone repo và tải FATE cùng pretrained weights.
-4. Import notebook `train_fate_relations.ipynb` từ repo GitHub.
-
-Các bước dùng GitHub chỉ thực hiện được sau khi repo đã được push. Nếu repo để private, notebook cần quyền truy cập GitHub; repo public có thể clone trực tiếp.
-
-### 2.2. Chọn đúng đường dẫn dataset
-
-Kaggle chuyển tên dataset thành slug viết thường. Xem đường dẫn thật trong bảng **Input**, sau đó thay `YOUR_DATASET` trong notebook bằng slug đó. Đường dẫn phải trỏ tới thư mục `dataset_v001/` và phép kiểm tra trong notebook phải thành công trước khi train.
-
-URL repo và đường dẫn thư mục training đã được khai báo sẵn trong notebook, không cần nhập lại ở README.
-
-### 2.3. Chạy notebook
-
-Chạy các cell theo thứ tự từ trên xuống. Notebook lần lượt thực hiện:
-
-1. Clone repo vào `/kaggle/working` và cài môi trường FATE.
-2. Trỏ cấu hình tới Kaggle Dataset, validate dữ liệu, chia tập và tạo control.
-3. Tải đúng phiên bản FATE, pretrained weights và kiểm tra khả năng nạp backbone.
-4. Trích đặc trưng FATE vào cache.
-5. Train các relation head và lưu checkpoint tốt nhất.
-6. Đánh giá trên test split và phân tích thử một clip thuộc test split.
-7. Đóng gói checkpoint, metrics, manifest và cấu hình thành `vn-av-forensics-artifacts.zip`.
-
-Nếu notebook yêu cầu restart session sau khi cài thư viện, restart rồi chạy tiếp lại từ cell cấu hình dataset. Khi phiên train bị ngắt, dùng lựa chọn resume đã ghi ngay trong cell training; chỉ resume khi `last.pt` còn tồn tại.
-
-### 2.4. Lưu kết quả
-
-Sau khi cell cuối hoàn tất, tải `vn-av-forensics-artifacts.zip` trong mục **Output** của Kaggle. File quan trọng nhất để chạy inference là `runs/fate-v001/best.pt`.
-
-Gói artifact gọn không chứa feature cache. Nếu muốn tiếp tục ở phiên Kaggle khác mà không trích đặc trưng lại, cần lưu thêm `cache/fate-v001/`, `runs/fate-v001/`, `datasets/manifests/` và `configs/` dưới dạng Kaggle Dataset output.
-## 3. Chạy demo frontend trên máy local
-
-### 3.1. Cài pipeline inference
-
-Trở về thư mục gốc của repo và tạo môi trường riêng cho training/demo:
+### Terminal 1 — Anaconda Prompt
 
 ```powershell
 conda create -n vn-av-training python=3.11 -y
 conda activate vn-av-training
-cd .\vn-av-forensics-training
+cd D:\COMP\RESEARCH\Deepfake_VN\vn-av-forensics\vn-av-forensics-training
 python -m pip install -e . -r environments/fate.txt
-```
-
-Tải FATE, pretrained weights và YuNet về đúng vị trí local:
-
-```powershell
 python -m vn_av_training setup --config configs/relations-local.yaml
 ```
 
-Giải nén artifact Kaggle và đặt checkpoint tại:
-
-```text
-vn-av-forensics-training/runs/fate-v001/best.pt
-```
-
-### 3.2. Build frontend React
+Giải nén artifact vào folder training để có `runs/fate-two-head-v1/best.pt`; giữ cấu hình encoder như khi tạo cache trên Kaggle. Nếu đã có môi trường tương thích thì activate và cài cập nhật package.
 
 ```powershell
-cd .\demo
-npm.cmd ci
-npm.cmd run build
-cd ..
+python -m vn_av_training checkpoint-info --config configs/relations-local.yaml
+python -m vn_av_training doctor --config configs/relations-local.yaml --stage inference --load
+python -m vn_av_training serve --config configs/relations-local.yaml
 ```
 
-Frontend sau khi build nằm ở `demo/dist/`. Nếu chưa build, backend vẫn có một trang HTML tối giản, nhưng bản React cung cấp đầy đủ giao diện timeline và tải kết quả.
+Backend ở http://127.0.0.1:8000, local mặc định CPU.
 
-### 3.3. Kiểm tra model và khởi động server
-
-```powershell
-python -m vn_av_training doctor `
-  --config configs/relations-local.yaml `
-  --stage inference `
-  --load
-
-python -m vn_av_training serve `
-  --config configs/relations-local.yaml
-```
-
-Mở [http://127.0.0.1:8000](http://127.0.0.1:8000), chọn một video có một người nói và nhấn **Phân tích video**. API nhận các định dạng `.mp4`, `.webm`, `.mov`, `.mkv`, `.avi`, `.mpg`; MP4 phù hợp nhất để phát lại trong trình duyệt. Cấu hình mặc định giới hạn video phân tích ở 60 giây.
-
-Local dùng CPU nên lần nạp model và phân tích có thể chậm. Giữ cửa sổ PowerShell đang chạy server; dùng `Ctrl+C` để dừng.
-
-### 3.4. Chạy frontend ở chế độ phát triển
-
-Khi cần sửa giao diện, chạy backend ở một PowerShell và chạy Vite ở PowerShell khác:
+### Terminal 2 — frontend
 
 ```powershell
 cd D:\COMP\RESEARCH\Deepfake_VN\vn-av-forensics\vn-av-forensics-training\demo
-npm.cmd run dev
+npm install
+npm run dev
 ```
 
-Mở [http://127.0.0.1:5173](http://127.0.0.1:5173). Vite tự proxy các request `/api` sang backend tại cổng `8000`.
+Mở **http://127.0.0.1:5173**. Nếu PowerShell chặn npm.ps1, dùng npm.cmd install và npm.cmd run dev.
+
+UI hiển thị tiến trình thực tế → ảnh/RMS/shape đặc trưng → chất lượng hai head → lag và cặp thời điểm được ghép → timeline/khoảng → tải video bằng chứng và JSON/CSV. Mặc định chỉ xem vùng đủ điều kiện; bật checkbox để xem điểm chẩn đoán. CSV tách cột diagnostic_ khỏi điểm đủ điều kiện. Video gốc không bị chỉnh; RMS/ảnh kiểm tra không phải giải thích âm vị.

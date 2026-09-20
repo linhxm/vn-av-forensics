@@ -164,6 +164,13 @@ def cut_media(source, output, start, end, origin):
 
 
 def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=None):
+    from vn_av_data.data.source_io import read_rows
+
+    progress = Path(manifest).resolve().parent / "download_results.csv"
+    if progress.exists() and any(r.get("status") != "downloaded" for r in read_rows(progress)):
+        raise ValueError(
+            "Download batch still contains pending/failed sources; finish step 02 first"
+        )
     from vn_av_data.data.vad import detect_speech
 
     cfg = dict(cfg["curation"])
@@ -227,6 +234,16 @@ def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=N
                     "source_sha256": source["sha256"],
                     "speaker_id": source.get("speaker_id") or "",
                     "dataset": source.get("dataset", "youtube"),
+                    **{
+                        key: source.get(key, "")
+                        for key in (
+                            "channel",
+                            "program_id",
+                            "episode_id",
+                            "canonical_source_id",
+                            "tier",
+                        )
+                    },
                     "source_start_s": start,
                     "source_end_s": end,
                     "face_ratio": ratio,

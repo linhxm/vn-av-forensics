@@ -8,6 +8,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -73,20 +74,31 @@ def create_app(cfg, analyzer_factory=None):
         item = get(sid)
         try:
             item.update(status="processing", stage="checkpoint", message="Đang nạp pipeline")
+            item.setdefault("steps", []).append(
+                {
+                    "stage": "checkpoint",
+                    "message": "Đang nạp checkpoint và backbone",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             put(item)
             if state["analyzer"] is None:
                 if analyzer_factory:
                     state["analyzer"] = analyzer_factory(cfg)
                 else:
-                    if cfg.get("pipeline") == "relations":
-                        from vn_av_training.serving.relations import RelationAnalyzer as Analyzer
-                    else:
-                        from vn_av_training.serving.inference import Analyzer
+                    from vn_av_training.serving.relations import RelationAnalyzer as Analyzer
 
                     state["analyzer"] = Analyzer(cfg)
 
             def progress(stage, message):
                 item.update(stage=stage, message=message)
+                item.setdefault("steps", []).append(
+                    {
+                        "stage": stage,
+                        "message": message,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
                 put(item)
 
             result = state["analyzer"].analyze(item["input_path"], root / sid, progress)
@@ -102,26 +114,15 @@ def create_app(cfg, analyzer_factory=None):
 
     @app.get("/api/health")
     def health():
-        if cfg.get("pipeline") == "relations":
-            from vn_av_training.serving.relations import relation_health
+        from vn_av_training.serving.relations import relation_health
 
-            return {**relation_health(cfg), "model_loaded": state["analyzer"] is not None}
-        required = {
-            "detector": cfg.get("checkpoint"),
-            **{k: cfg.get("encoder", {}).get(k) for k in ("checkpoint", "landmarks", "mean_face")},
-        }
-        missing = [k for k, v in required.items() if not v or not Path(v).is_file()]
-        return {
-            "ready": not missing,
-            "missing": missing,
-            "model_loaded": state["analyzer"] is not None,
-        }
+        return {**relation_health(cfg), "model_loaded": state["analyzer"] is not None}
 
     @app.post("/api/jobs", status_code=202)
     async def upload(video: UploadFile = File(...)):  # noqa: B008 -- FastAPI dependency declaration
         if not analyzer_factory and not health()["ready"]:
             raise HTTPException(
-                409, "Missing model assets: see FILE_MAP_AND_RUN.md and run relations-doctor"
+                409, "Missing model assets: see README.md and run doctor --stage inference"
             )
         ext = Path(video.filename or "").suffix.lower()
         if ext not in {".mp4", ".webm", ".mov", ".mkv", ".avi", ".mpg"}:
@@ -151,6 +152,7 @@ def create_app(cfg, analyzer_factory=None):
                 "input_path": str(path),
                 "result": None,
                 "error": None,
+                "steps": [],
             }
             put(item)
             executor.submit(process, sid)
@@ -188,33 +190,47 @@ def create_app(cfg, analyzer_factory=None):
             raise HTTPException(409, "This model has no temporal output")
         return FileResponse(path, filename="timeline.csv")
 
+    @app.get("/api/jobs/{sid}/evidence/{filename}")
+    def evidence(sid: str, filename: str):
+        item = get(sid)
+        if item["status"] != "complete":
+            raise HTTPException(409, "Evidence not ready")
+        if (
+            not filename.startswith("frame-")
+            or not filename.endswith(".jpg")
+            or "/" in filename
+            or "\\" in filename
+        ):
+            raise HTTPException(404, "Unknown evidence")
+        path = (root / sid / "evidence" / filename).resolve()
+        if not path.is_relative_to((root / sid / "evidence").resolve()) or not path.is_file():
+            raise HTTPException(404, "Missing evidence")
+        return FileResponse(path)
+
     @app.get("/api/jobs/{sid}/clips/{head}/{index}")
-    def clip(sid: str, head: str, index: int, context: float = 0.75):
+    def clip(sid: str, head: str, index: int, context: float = 0.75, diagnostic: bool = False):
         item = get(sid)
         if item["status"] != "complete":
             raise HTTPException(409, "Result not ready")
-        relation_mode = item["result"].get("schema_version") == "av-relations-v1"
-        if relation_mode:
-            segments = [
-                span for span in item["result"]["suspicious_intervals"] if span["relation"] == head
-            ]
-            allowed = item["result"]["thresholds"]
-        else:
-            segments = item["result"].get("segments", {}).get(head, [])
-            allowed = ("forgery", "mismatch")
+        segments = [
+            span
+            for span in item["result"].get("diagnostic_intervals" if diagnostic else "suspicious_intervals", [])
+            if span["relation"] == head
+        ]
+        allowed = item["result"].get("thresholds", {})
         if head not in allowed or not 0 <= index < len(segments):
             raise HTTPException(404, "Segment not found")
         span = segments[index]
         from vn_av_training.serving.evidence import export_clip
 
-        dest = root / sid / head
+        dest = root / sid / (head + ("-diagnostic" if diagnostic else "-assessed"))
         dest.mkdir(exist_ok=True)
         try:
             path = export_clip(
                 Path(item["input_path"]),
                 dest,
                 index,
-                [span["start"], span["end"]] if relation_mode else [span["start_s"], span["end_s"]],
+                [span["start"], span["end"]],
                 context,
             )
         except ValueError as exc:

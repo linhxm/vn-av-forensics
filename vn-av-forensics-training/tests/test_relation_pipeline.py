@@ -8,38 +8,48 @@ import torch
 
 from vn_av_training.common.runtime import load_config, save_npz, sha, write_json
 from vn_av_training.data.manifest import write_manifest
-from vn_av_training.data.relations import apply_variant, labels_for
 from vn_av_training.features.fate import window_plan
 from vn_av_training.training.relations import fit_relations, load_relations
 
 
-def test_shift_pcm_and_validity_without_wrap():
-    n, sample_rate = 20, 48000
-    source = {
-        "pcm": np.arange(n * 1920, dtype=np.float32),
-        "audio_valid": np.ones(n, bool),
-        "frames": np.zeros((n, 2, 2, 3)),
-        "visual_valid": np.ones(n, bool),
-    }
-    result = apply_variant(source, {"kind": "global_lag", "lag_s": 0.08}, sample_rate=sample_rate)
-    np.testing.assert_array_equal(result["pcm"][:-3840], source["pcm"][3840:])
-    assert not result["audio_valid"][-2:].any()
-    assert (result["pcm"][-3840:] == 0).all()
-    assert source["pcm"][-1] != 0
+def test_timing_calibration_does_not_discard_all_low_confidence_windows(relation_project):
+    from vn_av_training.models.relations import RelationHeads
+    from vn_av_training.training.relations import collect_validation
+
+    cfg, rows = relation_project
+    from vn_av_training.training.relations import load_sample
+
+    first, _, _, _ = load_sample(rows[0], cfg["cache"], 1)
+    model = RelationHeads(
+        first["audio"].shape[-1],
+        first["visual"].shape[-1],
+        projection=8,
+        hidden=8,
+        radius=1,
+        lag_confidence=1,
+    )
+    _, buckets = collect_validation(
+        model,
+        [r for r in rows if r["split"] == "validation"],
+        cfg["cache"],
+        "cpu",
+        ["timing", "lip_audio_mismatch"],
+    )
+    assert set(buckets["timing"]["labels"]) == {0, 1}
+    assert buckets["timing"]["accepted"] == 0
 
 
-def test_local_lag_transition_labels_and_independent_annotations():
-    row = {"duration_s": 8.0, "variant": {"kind": "local_lag", "lag_s": 0.4, "span": [2, 6]}}
-    times = np.arange(40) * 0.2
-    labels = labels_for(row, times, 1.0, 0.2, 4)
-    assert labels["lag_class"][16] == 6
-    assert labels["lag_class"][5] == 4
-    assert labels["lag_class"][9] == -1
-    assert (labels["motion_speech"] == -1).all()
-    row["relation_annotations"] = {"phoneme_viseme": {"known": [[0, 8]], "positive": [[3, 3.4]]}}
-    labels = labels_for(row, times, 1.0, 0.2, 4)
-    assert labels["phoneme_viseme"][15] == 1
-    assert labels["phoneme_viseme"][14] == 0
+def test_required_heads_fail_before_training_when_supervision_is_missing(relation_project):
+    cfg, _ = relation_project
+    cfg["training"]["required_heads"] = ["timing", "lip_audio_mismatch"]
+    rows = __import__("vn_av_training.data.manifest", fromlist=["read_manifest"]).read_manifest(
+        cfg["manifest"]
+    )
+    for row in rows:
+        row["relation_annotations"] = {}
+    write_manifest(cfg["manifest"], rows)
+    with pytest.raises(ValueError, match="required heads"):
+        fit_relations(cfg)
 
 
 def test_window_grid_has_physical_support_and_padding():
@@ -72,7 +82,20 @@ def relation_project(tmp_path):
                 "split": split,
                 "video": str(tmp_path / "unused.mp4"),
                 "duration_s": 8.0,
-                "variant": variant,
+                "variant": {"kind": "clean"},
+                "materialized": True,
+                "generation": {"edit": variant},
+                "supervision": {
+                    "timing": []
+                    if kind == "sequence_swap"
+                    else [{"start": 0, "end": 8, "lag_s": 0.2 if kind == "global_lag" else 0}]
+                },
+                "relation_annotations": {
+                    "lip_audio_mismatch": {
+                        "known": [[0, 8]],
+                        "positive": [[0, 8]] if kind == "sequence_swap" else [],
+                    }
+                },
             }
             path = cache / (sid + ".npz")
             values = rng.normal(size=(40, 8)).astype(np.float32)
@@ -111,7 +134,13 @@ def relation_project(tmp_path):
         "seed": 42,
         "encoder": {"window_s": 0.4, "step_s": 0.2},
         "model": {"projection": 8, "hidden": 8, "radius": 1, "context": 3},
-        "training": {"epochs": 1, "accumulation": 2, "torch_threads": 2, "patience": 0},
+        "training": {
+            "timing_warmup_epochs": 0,
+            "epochs": 1,
+            "accumulation": 2,
+            "torch_threads": 2,
+            "patience": 0,
+        },
     }
     return cfg, rows
 
@@ -125,14 +154,14 @@ def test_training_resume_evaluation_and_raw_analyzer_contract(relation_project, 
     result = fit_relations(cfg)
     assert Path(result["checkpoint"]).is_file()
     _model, state = load_relations(cfg["checkpoint"])
-    assert "sequence" in state["trained_heads"]
-    assert "phoneme_viseme" not in state["trained_heads"]
+    assert "lip_audio_mismatch" in state["trained_heads"]
+    assert set(state["trained_heads"]) <= {"timing", "lip_audio_mismatch"}
     cfg["training"]["epochs"] = 2
     fit_relations(cfg, resume=True)
     assert len(read_json(Path(cfg["output"]) / "history.json")) == 2
     metrics = evaluate_relations(cfg)
     assert metrics["samples"] == 3
-    assert "sequence" in metrics["relations"]
+    assert "lip_audio_mismatch" in metrics["relations"]
 
     class FixtureEncoder:
         signature = "synthetic-only"
@@ -147,10 +176,23 @@ def test_training_resume_evaluation_and_raw_analyzer_contract(relation_project, 
     report = RelationAnalyzer(cfg, encoder=FixtureEncoder()).analyze(
         "fixture.mp4", tmp_path / "analysis"
     )
-    assert report["schema_version"] == "av-relations-v1"
-    assert report["identity_status"] == "not_assessed"
+    assert report["schema_version"] == "av-relations-v2"
+    assert report["scope"] == ["timing", "lip_audio_mismatch"]
     assert (tmp_path / "analysis/timeline.csv").is_file()
-    assert report["head_availability"]["phoneme_viseme"] == "untrained"
+    assert set(report["head_availability"]) == {"timing", "lip_audio_mismatch"}
+    # Legacy checkpoints can expose threshold crossings but must not make findings.
+    state.pop("validation_report", None)
+    state.pop("deployable_heads", None)
+    state["thresholds"]["lip_audio_mismatch"] = 1e-6
+    torch.save(state, cfg["checkpoint"])
+    legacy = RelationAnalyzer(cfg, encoder=FixtureEncoder()).analyze(
+        "fixture.mp4", tmp_path / "legacy-analysis"
+    )
+    assert legacy["status"] == "diagnostic_only"
+    assert legacy["diagnostic_intervals"]
+    assert legacy["suspicious_intervals"] == []
+    assert legacy["clip_inconsistency_score"] is None
+    assert all(w["inconsistency_score"] is None for w in legacy["window_scores"])
     # Resume must reject a changed architecture rather than silently reuse weights.
     cfg["model"]["hidden"] = 9
     with pytest.raises(ValueError, match="differ"):
@@ -163,6 +205,26 @@ def test_training_does_not_read_test_cache(relation_project):
         if row["split"] == "test":
             (Path(cfg["cache"]) / (row["sample_id"] + ".npz")).unlink()
     fit_relations(cfg)
+
+
+def test_warmup_then_joint_and_old_checkpoint_rejection(relation_project):
+    cfg, rows = relation_project
+    cfg["training"].update(epochs=3, timing_warmup_epochs=1)
+    fit_relations(cfg)
+    from vn_av_training.common.runtime import read_json
+
+    history = read_json(Path(cfg["output"]) / "history.json")
+    assert [r["phase"] for r in history] == ["timing_warmup", "joint", "joint"]
+    _, state = load_relations(cfg["checkpoint"])
+    assert state["phase"] == "joint"
+    assert set(state["active_heads"]) == {"timing", "lip_audio_mismatch"}
+    cfg["training"]["epochs"] = 4
+    fit_relations(cfg, resume=True)
+    assert len(read_json(Path(cfg["output"]) / "history.json")) == 4
+    state["format"] = "fate-relations-v1"
+    torch.save(state, cfg["checkpoint"])
+    with pytest.raises(ValueError, match="Old five-head"):
+        load_relations(cfg["checkpoint"])
 
 
 def test_cli_config_and_doctor(capsys, tmp_path):
