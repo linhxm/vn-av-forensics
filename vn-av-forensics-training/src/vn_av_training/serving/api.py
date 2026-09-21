@@ -214,7 +214,9 @@ def create_app(cfg, analyzer_factory=None):
             raise HTTPException(409, "Result not ready")
         segments = [
             span
-            for span in item["result"].get("diagnostic_intervals" if diagnostic else "suspicious_intervals", [])
+            for span in item["result"].get(
+                "diagnostic_intervals" if diagnostic else "suspicious_intervals", []
+            )
             if span["relation"] == head
         ]
         allowed = item["result"].get("thresholds", {})

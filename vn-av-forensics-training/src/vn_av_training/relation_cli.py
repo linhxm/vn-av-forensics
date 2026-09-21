@@ -89,6 +89,10 @@ def main(argv):
         result = {
             key: state.get(key)
             for key in (
+                "format",
+                "phase",
+                "epoch",
+                "timing_warmup_epochs",
                 "active_heads",
                 "trained_heads",
                 "deployable_heads",

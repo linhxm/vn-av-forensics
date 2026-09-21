@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import csv
 import json
-import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 
-from vn_av_training.common.runtime import atomic_bytes, fingerprint, read_json, sha, write_json
+from vn_av_training.common.runtime import atomic_bytes, sha
 
 SPLITS = {"train", "validation", "test"}
 

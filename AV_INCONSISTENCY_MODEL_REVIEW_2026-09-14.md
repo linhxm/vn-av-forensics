@@ -38,7 +38,7 @@ Giữ ba folder độc lập: data thu clip sạch; generation chia nhóm rồi 
 
 Có năm kỹ thuật: global_lag, local_lag, sequence_swap, content_splice, motion_freeze; thêm clean đối chứng. Tạo đủ offset ±0,2/0,4/0,6/0,8 giây. Donor và mọi biến thể ở cùng split với nguồn; sạch và mẫu sửa encode cùng chính sách.
 
-Timing có offset đã biết ở vùng nguồn hợp lệ. Mismatch trên mẫu lag thuần túy là 0, tránh học nhầm timing thành nội dung. Thay câu/ghép audio/đóng băng chỉ có nhãn dương sau duyệt. Biên sửa, padding và nhãn chưa chắc được bỏ khỏi loss. Đóng băng toàn hình còn có nguy cơ tạo dấu hiệu dễ học; đo riêng từng kỹ thuật.
+Timing có offset đã biết ở vùng nguồn hợp lệ; cửa sổ vắt qua biên đổi lag không dùng cho loss timing. Mismatch trên mẫu lag thuần túy là 0 ở vùng hợp lệ, tránh học nhầm timing thành nội dung. Thay câu/ghép audio/đóng băng chỉ có nhãn dương sau duyệt, gán theo tâm cửa sổ trong khoảng được đánh dấu. Padding và nhãn chưa chắc bị loại khỏi loss. Đóng băng toàn hình còn có nguy cơ tạo dấu hiệu dễ học; đo riêng từng kỹ thuật.
 
 Chuyển nhãn cũ: hợp các vùng positive sequence/phoneme_viseme/motion_speech; negative chỉ khi cả ba được xác nhận khớp hoặc nhãn chung đã được duyệt trực tiếp. Source không tham gia. Migration xuất manifest mới, không sửa video hay nhãn gốc.
 

@@ -49,23 +49,28 @@ def test_evidence_download_uses_selected_assessed_or_diagnostic_interval(tmp_pat
 
     class TwoHeadFixture(TestAnalyzer):
         def analyze(self, path, output, progress):
-            return {"schema_version": "av-relations-v2", "thresholds": {"lip_audio_mismatch": .5},
-                    "suspicious_intervals": [{"relation": "lip_audio_mismatch", "start": 2, "end": 3}],
-                    "diagnostic_intervals": [{"relation": "lip_audio_mismatch", "start": 1, "end": 4}]}
+            return {
+                "schema_version": "av-relations-v2",
+                "thresholds": {"lip_audio_mismatch": 0.5},
+                "suspicious_intervals": [{"relation": "lip_audio_mismatch", "start": 2, "end": 3}],
+                "diagnostic_intervals": [{"relation": "lip_audio_mismatch", "start": 1, "end": 4}],
+            }
 
     exported = []
+
     def export(source, folder, index, interval, context):
         exported.append(interval)
         path = folder / "clip.mp4"
         path.write_bytes(b"fixture")
         return path
+
     monkeypatch.setattr(evidence, "export_clip", export)
     with TestClient(create_app({"jobs_dir": str(tmp_path / "jobs")}, TwoHeadFixture)) as client:
         sid = client.post("/api/jobs", files={"video": ("test.mp4", b"fixture")}).json()["id"]
         for _ in range(100):
             if client.get(f"/api/jobs/{sid}").json()["status"] == "complete":
                 break
-            time.sleep(.01)
+            time.sleep(0.01)
         url = f"/api/jobs/{sid}/clips/lip_audio_mismatch/0"
         assert client.get(url).status_code == 200
         assert client.get(url + "?diagnostic=true").status_code == 200

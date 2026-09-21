@@ -7,28 +7,51 @@ from vn_av_training.training.quality import calibrate, head_status
 def test_legacy_union_keeps_partial_negatives_unknown():
     from vn_av_training.contract import mismatch_annotation
 
-    assert mismatch_annotation({"sequence": {"known": [[0, 6]], "positive": []}}, 6) == {"known": [], "positive": []}
-    labels = {name: {"known": [[0, 6]], "positive": []} for name in ("sequence", "phoneme_viseme", "motion_speech")}
+    assert mismatch_annotation({"sequence": {"known": [[0, 6]], "positive": []}}, 6) == {
+        "known": [],
+        "positive": [],
+    }
+    labels = {
+        name: {"known": [[0, 6]], "positive": []}
+        for name in ("sequence", "phoneme_viseme", "motion_speech")
+    }
     labels["sequence"]["positive"] = [[2, 3]]
     assert mismatch_annotation(labels, 6) == {"known": [[0, 6]], "positive": [[2, 3]]}
-    assert mismatch_annotation({"source": {"known": [[0, 6]], "positive": [[0, 6]]}}, 6)["positive"] == []
+    assert (
+        mismatch_annotation({"source": {"known": [[0, 6]], "positive": [[0, 6]]}}, 6)["positive"]
+        == []
+    )
 
 
 def test_uncertain_lag_requires_validated_unaligned_mismatch():
     import torch
+
     from vn_av_training.training.quality import assessment_masks
 
-    output = {"valid": torch.tensor([[True, True, False]]), "lag_valid": torch.tensor([[True, False, False]])}
+    output = {
+        "valid": torch.tensor([[True, True, False]]),
+        "lag_valid": torch.tensor([[True, False, False]]),
+    }
     assert assessment_masks(output, {})["mismatch_valid"].tolist() == [[True, False, False]]
     state = {"validation_report": {"lip_audio_mismatch": {"unaligned_ready": True}}}
     assert assessment_masks(output, state)["mismatch_valid"].tolist() == [[True, True, False]]
 
 
 def test_shift_only_is_negative_for_residual_mismatch_and_boundaries_unknown():
-    row = {"duration_s": 8, "variant": {"kind": "clean"}, "materialized": True,
-           "generation": {"edit": {"kind": "local_lag"}},
-           "supervision": {"timing": [{"start": 0, "end": 2, "lag_s": 0}, {"start": 2, "end": 6, "lag_s": .4}, {"start": 6, "end": 8, "lag_s": 0}]}}
-    targets = labels_for(row, np.arange(40)*.2, 2, .2, 4)
+    row = {
+        "duration_s": 8,
+        "variant": {"kind": "clean"},
+        "materialized": True,
+        "generation": {"edit": {"kind": "local_lag"}},
+        "supervision": {
+            "timing": [
+                {"start": 0, "end": 2, "lag_s": 0},
+                {"start": 2, "end": 6, "lag_s": 0.4},
+                {"start": 6, "end": 8, "lag_s": 0},
+            ]
+        },
+    }
+    targets = labels_for(row, np.arange(40) * 0.2, 2, 0.2, 4)
     assert targets["lag_class"][16] == 6
     assert targets["lip_audio_mismatch"][16] == 0
     assert targets["lag_class"][9] == -1

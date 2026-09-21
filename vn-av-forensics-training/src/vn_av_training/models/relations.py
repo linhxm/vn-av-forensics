@@ -96,7 +96,10 @@ class RelationHeads(nn.Module):
         # Never force a different utterance to match. Keep the raw pair if uncertain.
         aligned_v = torch.where(lag_valid[..., None], aligned_v, v)
         if progress:
-            progress("mismatch", "Đang so môi–âm thanh bằng cặp đặc trưng gốc và cặp căn chỉnh đáng tin; không sửa video")
+            progress(
+                "mismatch",
+                "Đang so môi–âm thanh bằng cặp đặc trưng gốc và cặp căn chỉnh đáng tin; không sửa video",
+            )
         x = F.gelu(
             self.fusion(
                 torch.cat(

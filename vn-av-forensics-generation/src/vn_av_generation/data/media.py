@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
-from vn_av_generation.common.runtime import require_file, run
+from vn_av_generation.common.runtime import require_file
 
 
 def ffmpeg():

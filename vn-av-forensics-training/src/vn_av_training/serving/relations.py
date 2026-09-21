@@ -208,7 +208,9 @@ class RelationAnalyzer:
         row["duration_s"] = meta["duration_s"]
         batch, _, _, times = load_sample(row, folder, self.model.config["radius"], self.device)
         progress("relations", "Đang đánh giá quan hệ tiếng nói–chuyển động miệng")
-        prediction = self.model(batch, use_lag_alignment="timing" in self.state["active_heads"], progress=progress)
+        prediction = self.model(
+            batch, use_lag_alignment="timing" in self.state["active_heads"], progress=progress
+        )
         progress("aggregation", "Đang tổng hợp theo thời gian và kiểm tra chất lượng từng nhánh")
         report = aggregate_relations(
             prediction,
@@ -297,16 +299,30 @@ class RelationAnalyzer:
         import csv
 
         with (folder / "timeline.csv").open("w", encoding="utf-8", newline="") as stream:
-            keys = ["start", "end", "inconsistency_score", "estimated_lag_ms",
-                    "diagnostic_inconsistency_score", "diagnostic_estimated_lag_ms",
-                    "alignment_used", "matched_visual_time_s", "lag_confidence"]
+            keys = [
+                "start",
+                "end",
+                "inconsistency_score",
+                "estimated_lag_ms",
+                "diagnostic_inconsistency_score",
+                "diagnostic_estimated_lag_ms",
+                "alignment_used",
+                "matched_visual_time_s",
+                "lag_confidence",
+            ]
             heads = self.state["trained_heads"]
-            writer = csv.DictWriter(stream, fieldnames=keys + list(heads) + ["diagnostic_" + h for h in heads])
+            writer = csv.DictWriter(
+                stream, fieldnames=keys + list(heads) + ["diagnostic_" + h for h in heads]
+            )
             writer.writeheader()
             for window in report["window_scores"]:
-                writer.writerow({**{key: window[key] for key in keys},
-                                 **{h: window["accepted_relation_scores"].get(h) for h in heads},
-                                 **{"diagnostic_"+h: window["relation_scores"].get(h) for h in heads}})
+                writer.writerow(
+                    {
+                        **{key: window[key] for key in keys},
+                        **{h: window["accepted_relation_scores"].get(h) for h in heads},
+                        **{"diagnostic_" + h: window["relation_scores"].get(h) for h in heads},
+                    }
+                )
         progress("complete", "Đã lưu khoảng khả nghi và điểm theo thời gian")
         return report
 

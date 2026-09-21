@@ -47,9 +47,7 @@ def summarize_buckets(buckets, thresholds):
             )
             negatives = labels == 0
             false_alarm = (
-                float(np.mean(scores[negatives] >= thresholds[name]))
-                if negatives.any()
-                else None
+                float(np.mean(scores[negatives] >= thresholds[name])) if negatives.any() else None
             )
         else:
             precision = recall = f1 = false_alarm = None
@@ -119,8 +117,14 @@ def evaluate_relations(cfg, split="test"):
             score = np.asarray([value if value is not None else 0 for value in values])
             mask = known & measured
             kind = row.get("generation", {}).get("edit", {}).get("kind", "unknown")
-            group = by_generator.setdefault(kind, {}).setdefault(name, {"labels": [], "scores": [], "events": np.zeros(3, int), "known": 0, "assessed": 0})
-            counts = event_counts(spans(mask & (score >= state["thresholds"][name]), times, meta["step_s"]), spans(known & (labels == 1), times, meta["step_s"]))
+            group = by_generator.setdefault(kind, {}).setdefault(
+                name,
+                {"labels": [], "scores": [], "events": np.zeros(3, int), "known": 0, "assessed": 0},
+            )
+            counts = event_counts(
+                spans(mask & (score >= state["thresholds"][name]), times, meta["step_s"]),
+                spans(known & (labels == 1), times, meta["step_s"]),
+            )
             for dest in (bucket, group):
                 dest["known"] += int(known.sum())
                 dest["assessed"] += int(mask.sum())
@@ -135,7 +139,10 @@ def evaluate_relations(cfg, split="test"):
         "split": split,
         "samples": len(rows),
         "relations": summary,
-        "by_generator": {kind: summarize_buckets(group, state["thresholds"]) for kind, group in by_generator.items()},
+        "by_generator": {
+            kind: summarize_buckets(group, state["thresholds"])
+            for kind, group in by_generator.items()
+        },
         "lag_mae_ms": float(np.mean(lag_errors)) if lag_errors else None,
         "scope": ["timing", "lip_audio_mismatch"],
         "label_note": "Mismatch is residual AV incompatibility, not identity or manipulation-method classification",

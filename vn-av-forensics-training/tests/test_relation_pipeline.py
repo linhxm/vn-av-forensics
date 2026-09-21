@@ -162,6 +162,8 @@ def test_training_resume_evaluation_and_raw_analyzer_contract(relation_project, 
     metrics = evaluate_relations(cfg)
     assert metrics["samples"] == 3
     assert "lip_audio_mismatch" in metrics["relations"]
+    assert set(metrics["by_generator"]) == {"clean", "global_lag", "sequence_swap"}
+    assert metrics["by_generator"]["clean"]["lip_audio_mismatch"]["average_precision"] is None
 
     class FixtureEncoder:
         signature = "synthetic-only"

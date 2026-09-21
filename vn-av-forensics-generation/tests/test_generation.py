@@ -161,16 +161,24 @@ def test_render_resume_review_and_portable_training_handoff(clean_bundle, tmp_pa
     )
     # Conversion preserves rendered files and original labels, excludes source-only samples.
     import copy
+
     legacy_rows = copy.deepcopy(rows)
     for row in legacy_rows:
-        row["relation_annotations"] = {"sequence": row["relation_annotations"].get("lip_audio_mismatch", {"known": [], "positive": []})}
+        row["relation_annotations"] = {
+            "sequence": row["relation_annotations"].get(
+                "lip_audio_mismatch", {"known": [], "positive": []}
+            )
+        }
     excluded = copy.deepcopy(legacy_rows[0])
     excluded["sample_id"] += "_source"
     excluded["generation"]["edit"]["kind"] = "source_swap"
     legacy_rows.append(excluded)
     legacy_path = moved / "legacy-reviewed.jsonl"
     write_manifest(legacy_path, legacy_rows)
-    write_json(legacy_path.with_suffix(".info.json"), {"manifest_sha256": sha(legacy_path), "samples": len(legacy_rows)})
+    write_json(
+        legacy_path.with_suffix(".info.json"),
+        {"manifest_sha256": sha(legacy_path), "samples": len(legacy_rows)},
+    )
     before = sha(legacy_path)
     migrated = migrate_labels(moved, legacy_path.name, moved / "manifest-two-heads.jsonl")
     assert migrated["excluded_source_swap"] == 1
@@ -187,7 +195,12 @@ def test_render_resume_review_and_portable_training_handoff(clean_bundle, tmp_pa
 
         result = import_generated(moved, tmp_path / "train.jsonl", "manifest-reviewed.jsonl")
         assert result["samples"] == 36
-        assert import_generated(moved, tmp_path / "migrated-train.jsonl", "manifest-two-heads.jsonl")["samples"] == 36
+        assert (
+            import_generated(moved, tmp_path / "migrated-train.jsonl", "manifest-two-heads.jsonl")[
+                "samples"
+            ]
+            == 36
+        )
         from vn_av_training.data.labels import labels_for
 
         rendered = next(r for r in rows if r["generation"]["edit"]["kind"] == "global_lag")
